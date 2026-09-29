@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# container-start — the Cloudflare job wrapper (docs/cloudflare.md).
+#
+# Container disk on Cloudflare is ephemeral, so the CRM (one SQLite file) and
+# the operator's state directory (model caches) live in R2 between runs. This
+# wrapper downloads them, runs one bounded job, and uploads them back — also
+# on SIGTERM, which the platform sends (then waits up to 15 minutes) before
+# SIGKILL. A hard kill between the checkpoint and the upload loses that run's
+# writes; the next run continues, because a goal is "N more than you have".
+#
+# The R2 traffic goes through the Worker's outbound handler on the virtual
+# hostname state.internal — the container itself holds no R2 credentials.
+#
+# The job, matching the VM deploy's compose/start:
+#   default:  openoutreach find <goal> <unit>     (goal 10, unit emails)
+#   SEND=1:   openoutreach run <goal>             (find → ingest → send)
+# Arguments given to this script override the environment, as in
+# `docker run ... 10 emails`.
+set -euo pipefail
+
+DB="${OPENOUTREACH_DB:-/app/data/db.sqlite3}"
+DATA_DIR="$(dirname "$DB")"
+LEADS="$DATA_DIR/leads.csv"
+STATE="${STATE_HOST:-state.internal}"
+HOME_TAR="/tmp/home.tar.zst"
+mkdir -p "$DATA_DIR" "$HOME"
+
+log() { echo "[container-start] $*" >&2; }
+
+# ── state sync, over the outbound proxy ───────────────────────────
+
+restore() { # restore <r2-key> <dest>: 0 = fetched, 1 = not in R2 yet, 2 = store unreachable
+    local code
+    code=$(curl -sS --max-time 300 -o "$2" -w '%{http_code}' "http://$STATE/$1" 2>/dev/null) || return 2
+    case "$code" in
+        200) return 0 ;;
+        404) rm -f "$2"; return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+upload() { # upload <file> <r2-key>
+    curl -fsS --max-time 900 -T "$1" "http://$STATE/$2"
+}
+
+checkpoint() { # fold the WAL back into the main file before it is uploaded
+    python - "$DB" <<'PY' >&2 || log "warning: WAL checkpoint failed"
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print("[container-start] checkpoint:", conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+PY
+}
+
+sync_up() {
+    set +e
+    checkpoint
+    upload "$DB" db.sqlite3 && log "CRM uploaded" || log "WARNING: CRM upload failed"
+    for suffix in wal shm; do
+        [ -f "$DB-$suffix" ] && upload "$DB-$suffix" "db.sqlite3-$suffix"
+    done
+    if tar -I zstd -cf "$HOME_TAR" -C "$HOME" . 2>/dev/null; then
+        upload "$HOME_TAR" home.tar.zst && log "state dir uploaded" || log "WARNING: state dir upload failed"
+    else
+        log "warning: could not pack the state dir"
+    fi
+    [ -f "$LEADS" ] && upload "$LEADS" leads.csv && log "leads.csv uploaded"
+}
+
+# ── restore the state this job starts from ────────────────────────
+
+rc=0; restore db.sqlite3 "$DB" || rc=$?
+case "$rc" in
+    0) log "CRM restored from R2" ;;
+    1) log "no CRM in R2 yet — this run starts a fresh one" ;;
+    *) log "FATAL: state store unreachable (rc=$rc); refusing to run a job without the CRM"
+       exit 1 ;;
+esac
+
+rc=0; restore home.tar.zst "$HOME_TAR" || rc=$?
+case "$rc" in
+    0) tar -I zstd -xf "$HOME_TAR" -C "$HOME" && log "state dir restored" \
+           || log "warning: state dir unpack failed (continuing without it)"
+       rm -f "$HOME_TAR" ;;
+    1) log "no state dir in R2 yet — first run" ;;
+    *) log "FATAL: state store unreachable (rc=$rc)"; exit 1 ;;
+esac
+
+# ── the job ───────────────────────────────────────────────────────
+
+if [ "$#" -gt 0 ]; then
+    set -- openoutreach find "$@"
+elif [ "${OPENOUTREACH_SEND:-0}" = "1" ]; then
+    set -- openoutreach run "${OPENOUTREACH_GOAL:-10}"
+else
+    set -- openoutreach find "${OPENOUTREACH_GOAL:-10}" "${OPENOUTREACH_UNIT:-emails}"
+fi
+
+log "running: $*"
+"$@" > "$LEADS" &
+JOB=$!
+
+# The platform signals PID 1 only; forward it to the job, then sync after it
+# dies. `wait` is interruptible by a trapped signal, which is what makes the
+# trap fire while the job is still running.
+trap 'kill -TERM "$JOB" 2>/dev/null || true' TERM INT
+RC=0
+wait "$JOB" || RC=$?
+trap - TERM INT
+
+log "job exited with $RC"
+sync_up
+exit "$RC"

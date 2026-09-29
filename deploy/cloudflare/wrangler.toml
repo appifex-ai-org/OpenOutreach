@@ -1,0 +1,56 @@
+# wrangler.toml — the Cloudflare deploy (docs/cloudflare.md).
+#
+# One Worker: a cron trigger that starts one bounded job, plus HTTP endpoints
+# to watch and drive it. The container image is built from ./Dockerfile
+# (build context: this directory) and pushed to the Cloudflare Registry on
+# `wrangler deploy`.
+
+name = "openoutreach"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Container logs land in the dashboard (Workers & Pages → Containers) and in
+# `wrangler tail`. Retention follows Workers Logs (7 days on the paid plan).
+[observability]
+enabled = true
+
+# When the job runs — UTC. Align this with the mailbox's sending window: the
+# sender counts its daily cap from the operator's midnight, not the server's,
+# and paces mail inside its sending window regardless.
+[triggers]
+crons = ["0 9 * * 1-5"]
+
+# The goal, in the same units as the CLI: `10` `emails` = ten more leads
+# carrying a verified address (at most 10 credits). Set OPENOUTREACH_SEND = "1"
+# to also mail what was found — the `run` flow: find → ingest → send. Off by
+# default: nothing sends until the operator asks, same rule as the CLI.
+[vars]
+OPENOUTREACH_GOAL = "10"
+OPENOUTREACH_UNIT = "emails"
+OPENOUTREACH_SEND = "0"
+
+# The job container. standard-1 (½ vCPU, 4 GiB, 8 GB disk): the venv with
+# sklearn/onnxruntime wants the disk, the embedding model wants the memory.
+# Billed only while the job actually runs.
+[[containers]]
+class_name = "OutreachContainer"
+image = "./Dockerfile"
+image_build_context = "."
+instance_type = "standard-1"
+
+# One *named* instance is the mutex. "One job per database, ever" is enforced
+# by cron and the HTTP endpoints addressing the same singleton — the Durable
+# Object serializes them.
+[[durable_objects.bindings]]
+name = "OUTREACH"
+class_name = "OutreachContainer"
+
+[exports.OutreachContainer]
+type = "durable-object"
+storage = "sqlite"
+
+# The CRM between runs: db.sqlite3, home.tar.zst (model caches), leads.csv.
+# Create it once with: npx wrangler r2 bucket create openoutreach-crm
+[[r2_buckets]]
+binding = "CRM"
+bucket_name = "openoutreach-crm"

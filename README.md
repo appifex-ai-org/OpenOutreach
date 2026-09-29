@@ -283,7 +283,9 @@ Working on the pipeline itself? It is not here — clone
 `uv pip install -e ../OpenOutFind`.
 
 Running it on a server instead? A Docker image is published to GitHub Container Registry for exactly
-that — see the **[Docker Guide](./docs/docker.md)**.
+that — see the **[Docker Guide](./docs/docker.md)**. Or run it as a scheduled job on Cloudflare
+(Containers + Cron Triggers + R2, no server of your own) — see the
+**[Cloudflare Guide](./docs/cloudflare.md)**.
 
 ---
 
