@@ -138,6 +138,20 @@ export class OutreachContainer extends Container {
     return { ok: true, keys: Object.keys(env).length, restarted: running };
   }
 
+  /**
+   * Called by the Worker (trusted): drop this workspace's configuration and
+   * kill its container. SIGKILL, not SIGTERM — a graceful stop would sync
+   * state back to R2 just as the Worker deletes it.
+   */
+  async forget(): Promise<{ configured: boolean; wasRunning: boolean }> {
+    const configured = (await this.stored()) !== null;
+    const state = await this.getState();
+    const wasRunning = state.status === "running" || state.status === "healthy" || state.status === "stopping";
+    if (this.ctx.container?.running) await this.destroy();
+    await this.ctx.storage.delete("config");
+    return { configured, wasRunning };
+  }
+
   async getConfig(): Promise<{ ws: string; keys: string[] } | null> {
     const config = await this.stored();
     return config ? { ws: config.ws, keys: Object.keys(config.env).sort() } : null;
@@ -217,6 +231,7 @@ export default {
         endpoints: [
           "PUT  /w/<ws>/config            — the OUTSEND_* environment for this workspace",
           "GET  /w/<ws>/config            — which keys are set (values never returned)",
+          "DELETE /w/<ws>                 — forget the workspace: config, container, R2 state",
           "POST /w/<ws>/ingest            — JSON Lines body: leads in, upserted on lead_id",
           "POST /w/<ws>/send              — {n?} start a sending pass (--agent-draft)",
           "POST /w/<ws>/draft             — {subject, body} answer the pending draft",
@@ -277,6 +292,23 @@ export default {
         return Response.json(await stub.setConfig(ws, clean));
       }
       return new Response("method not allowed", { status: 405 });
+    }
+
+    // Forgetting a workspace: config, container and every R2 object under
+    // its prefix. Irreversible — the database goes with it.
+    if (path === "/" && request.method === "DELETE") {
+      const forgotten = await getContainer(env.OUTREACH, ws).forget();
+      let deleted = 0;
+      let cursor: string | undefined;
+      do {
+        const page = await env.CRM.list({ prefix: `crm/${ws}/`, cursor });
+        if (page.objects.length > 0) {
+          await env.CRM.delete(page.objects.map((o) => o.key));
+          deleted += page.objects.length;
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return Response.json({ ...forgotten, objectsDeleted: deleted });
     }
 
     // The database file is served straight from R2 — no container needed.
