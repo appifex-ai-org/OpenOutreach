@@ -12,7 +12,7 @@
 #  - curl + zstd + tar for the R2 state sync in container-start
 #  - ENTRYPOINT is the state-sync wrapper, not the compose entrypoint
 
-ARG OPENOUTREACH_VERSION=0.1.57
+ARG OPENOUTREACH_VERSION=0.1.60
 
 # ── Stage 1: a venv holding the released package and its dependencies ──
 FROM python:3.12-slim-bookworm AS deps
@@ -41,7 +41,7 @@ WORKDIR ${APP_HOME}
 RUN mkdir -p /app/data \
     && chmod -R a+rwX /app /home/ubuntu
 
-COPY container-start /container-start
+COPY container-start shim.py /
 RUN chmod +x /container-start
 
 # The CRM is not in the image: container-start downloads it from R2 before the

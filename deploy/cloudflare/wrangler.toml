@@ -1,46 +1,29 @@
-# wrangler.toml — the Cloudflare deploy (docs/cloudflare.md).
+# wrangler.toml — the multi-tenant outreach engine (docs/cloudflare.md).
 #
-# One Worker: a cron trigger that starts one bounded job, plus HTTP endpoints
-# to watch and drive it. The container image is built from ./Dockerfile
-# (build context: this directory) and pushed to the Cloudflare Registry on
-# `wrangler deploy`.
+# One Worker fronts every workspace; each gets its own named container
+# instance (its own Durable Object, database and R2 prefix). The calling
+# agent — voki's trusted application — authenticates with a service token
+# and drives send/CRM over HTTP. There is no cron here: when a workspace's
+# sending pass runs is the caller's scheduling decision, not the engine's.
 
-name = "openoutreach"
+name = "openoutreach-engine"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 
-# Container logs land in the dashboard (Workers & Pages → Containers) and in
-# `wrangler tail`. Retention follows Workers Logs (7 days on the paid plan).
+# Engine logs land in the dashboard and `wrangler tail`.
 [observability]
 enabled = true
 
-# When the job runs — UTC. Align this with the mailbox's sending window: the
-# sender counts its daily cap from the operator's midnight, not the server's,
-# and paces mail inside its sending window regardless.
-[triggers]
-crons = ["0 9 * * 1-5"]
-
-# The goal, in the same units as the CLI: `10` `emails` = ten more leads
-# carrying a verified address (at most 10 credits). Set OPENOUTREACH_SEND = "1"
-# to also mail what was found — the `run` flow: find → ingest → send. Off by
-# default: nothing sends until the operator asks, same rule as the CLI.
-[vars]
-OPENOUTREACH_GOAL = "10"
-OPENOUTREACH_UNIT = "emails"
-OPENOUTREACH_SEND = "0"
-
-# The job container. standard-1 (½ vCPU, 4 GiB, 8 GB disk): the venv with
-# sklearn/onnxruntime wants the disk, the embedding model wants the memory.
-# Billed only while the job actually runs.
+# The engine container. standard-1 (½ vCPU, 4 GiB, 8 GB disk) is roomy for
+# what is now a sender + CRM; billing stops when the instance sleeps.
+# Image: built and pushed with `npx wrangler containers build --push -t openoutreach-engine:v3 .`
 [[containers]]
 class_name = "OutreachContainer"
-image = "./Dockerfile"
-image_build_context = "."
+image = "registry.cloudflare.com/5db6a7cf9dc844657c4b9ce8eb7da202/openoutreach-engine:v3"
 instance_type = "standard-1"
 
-# One *named* instance is the mutex. "One job per database, ever" is enforced
-# by cron and the HTTP endpoints addressing the same singleton — the Durable
-# Object serializes them.
+# The named-instance binding: getContainer(OUTREACH, <workspaceId>) is both
+# the address and the mutex — one job per database, ever, per workspace.
 [[durable_objects.bindings]]
 name = "OUTREACH"
 class_name = "OutreachContainer"
@@ -49,8 +32,14 @@ class_name = "OutreachContainer"
 type = "durable-object"
 storage = "sqlite"
 
-# The CRM between runs: db.sqlite3, home.tar.zst (model caches), leads.csv.
-# Create it once with: npx wrangler r2 bucket create openoutreach-crm
+# Per-workspace state lives here between runs: crm/<ws>/db.sqlite3,
+# home.tar.gz, job.json. Create once with:
+#   npx wrangler r2 bucket create openoutreach-crm
 [[r2_buckets]]
 binding = "CRM"
 bucket_name = "openoutreach-crm"
+
+# Secrets (npx wrangler secret put <NAME>):
+#   OUTREACH_SERVICE_TOKEN — the bearer token the calling agent presents.
+# Per-workspace configuration arrives via PUT /w/<ws>/config and is held in
+# each workspace's Durable Object storage, applied as the container env.

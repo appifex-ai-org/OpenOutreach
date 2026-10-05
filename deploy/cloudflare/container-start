@@ -1,37 +1,45 @@
 #!/usr/bin/env bash
-# container-start — the Cloudflare job wrapper (docs/cloudflare.md).
+# container-start — server-mode entrypoint for the per-workspace engine
+# (docs/cloudflare.md).
 #
-# Container disk on Cloudflare is ephemeral, so the CRM (one SQLite file) and
-# the operator's state directory (model caches) live in R2 between runs. This
-# wrapper downloads them, runs one bounded job, and uploads them back — also
-# on SIGTERM, which the platform sends (then waits up to 15 minutes) before
-# SIGKILL. A hard kill between the checkpoint and the upload loses that run's
-# writes; the next run continues, because a goal is "N more than you have".
+# The container runs the HTTP shim on :8080 for the life of the instance,
+# and the Worker forwards the calling agent's requests to it. Disk is
+# ephemeral, so this entrypoint restores the workspace's state from R2
+# first (the shim re-uploads it after every change), and the shim handles
+# SIGTERM with a final sync.
 #
-# The R2 traffic goes through the Worker's outbound handler on the virtual
-# hostname state.internal — the container itself holds no R2 credentials.
-#
-# The job, matching the VM deploy's compose/start:
-#   default:  openoutreach find <goal> <unit>     (goal 10, unit emails)
-#   SEND=1:   openoutreach run <goal>             (find → ingest → send)
-# Arguments given to this script override the environment, as in
-# `docker run ... 10 emails`.
+# Every boot step reports itself to R2 as boot.log — the one channel that
+# works even when nothing else can talk to a dying instance.
 set -euo pipefail
 
 DB="${OPENOUTREACH_DB:-/app/data/db.sqlite3}"
-DATA_DIR="$(dirname "$DB")"
-LEADS="$DATA_DIR/leads.csv"
 STATE="${STATE_HOST:-state.internal}"
-HOME_TAR="/tmp/home.tar.zst"
-mkdir -p "$DATA_DIR" "$HOME"
+WS="${WORKSPACE_ID:-default}"
+PREFIX="crm/$WS"
+mkdir -p "$(dirname "$DB")" "$HOME"
 
-log() { echo "[container-start] $*" >&2; }
+log() { echo "[engine:$WS] $*" >&2 || true; }
 
-# ── state sync, over the outbound proxy ───────────────────────────
+# Boot transcript: the entrypoint's own narration lands in /tmp/boot.log — a
+# plain file, so a hostile or closed platform stdout/stderr pipe can never
+# fail a write and take the script down under `set -e` — and every step
+# uploads it to R2, so a dying instance still leaves its story behind.
+# The shim itself talks to the platform's real pipes (fds 3/4), so live logs
+# keep working wherever the platform can carry them.
+exec 3>&1 4>&2
+exec >> /tmp/boot.log 2>&1
+boot_flush() { curl -sS --max-time 5 -X PUT --data-binary @/tmp/boot.log "http://$STATE/$PREFIX/boot.log" 2>/dev/null || true; }
+trap 'boot_flush' EXIT
+step() { log "$*"; boot_flush; }
 
-restore() { # restore <r2-key> <dest>: 0 = fetched, 1 = not in R2 yet, 2 = store unreachable
+step "entrypoint reached (ws=$WS uid=$(id -u))"
+
+# ── restore the state this instance starts from ─────────────────────
+# (the job document is read by the shim itself at boot)
+
+restore() { # restore <r2-key> <dest>: 0 fetched, 1 absent, 2 unreachable
     local code
-    code=$(curl -sS --max-time 300 -o "$2" -w '%{http_code}' "http://$STATE/$1" 2>/dev/null) || return 2
+    code=$(curl -sS --max-time 300 -o "$2" -w '%{http_code}' "http://$STATE/$PREFIX/$1" 2>/dev/null) || return 2
     case "$code" in
         200) return 0 ;;
         404) rm -f "$2"; return 1 ;;
@@ -39,74 +47,46 @@ restore() { # restore <r2-key> <dest>: 0 = fetched, 1 = not in R2 yet, 2 = store
     esac
 }
 
-upload() { # upload <file> <r2-key>
-    curl -fsS --max-time 900 -T "$1" "http://$STATE/$2"
-}
-
-checkpoint() { # fold the WAL back into the main file before it is uploaded
-    python - "$DB" <<'PY' >&2 || log "warning: WAL checkpoint failed"
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-print("[container-start] checkpoint:", conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
-PY
-}
-
-sync_up() {
-    set +e
-    checkpoint
-    upload "$DB" db.sqlite3 && log "CRM uploaded" || log "WARNING: CRM upload failed"
-    for suffix in wal shm; do
-        [ -f "$DB-$suffix" ] && upload "$DB-$suffix" "db.sqlite3-$suffix"
-    done
-    if tar -I zstd -cf "$HOME_TAR" -C "$HOME" . 2>/dev/null; then
-        upload "$HOME_TAR" home.tar.zst && log "state dir uploaded" || log "WARNING: state dir upload failed"
-    else
-        log "warning: could not pack the state dir"
-    fi
-    [ -f "$LEADS" ] && upload "$LEADS" leads.csv && log "leads.csv uploaded"
-}
-
-# ── restore the state this job starts from ────────────────────────
-
 rc=0; restore db.sqlite3 "$DB" || rc=$?
 case "$rc" in
-    0) log "CRM restored from R2" ;;
-    1) log "no CRM in R2 yet — this run starts a fresh one" ;;
-    *) log "FATAL: state store unreachable (rc=$rc); refusing to run a job without the CRM"
-       exit 1 ;;
+    0) step "CRM restored from R2" ;;
+    1) step "no CRM in R2 yet — fresh workspace" ;;
+    *) step "FATAL: state store unreachable (rc=$rc)"; exit 1 ;;
 esac
 
-rc=0; restore home.tar.zst "$HOME_TAR" || rc=$?
-case "$rc" in
-    0) tar -I zstd -xf "$HOME_TAR" -C "$HOME" && log "state dir restored" \
-           || log "warning: state dir unpack failed (continuing without it)"
-       rm -f "$HOME_TAR" ;;
-    1) log "no state dir in R2 yet — first run" ;;
-    *) log "FATAL: state store unreachable (rc=$rc)"; exit 1 ;;
-esac
-
-# ── the job ───────────────────────────────────────────────────────
-
-if [ "$#" -gt 0 ]; then
-    set -- openoutreach find "$@"
-elif [ "${OPENOUTREACH_SEND:-0}" = "1" ]; then
-    set -- openoutreach run "${OPENOUTREACH_GOAL:-10}"
+rc=0; restore home.tar.gz /tmp/home.tar.gz || rc=$?
+if [ "$rc" -eq 0 ]; then
+    tar -xzf /tmp/home.tar.gz -C "$HOME" && step "home restored" || step "warning: home unpack failed"
+    rm -f /tmp/home.tar.gz
 else
-    set -- openoutreach find "${OPENOUTREACH_GOAL:-10}" "${OPENOUTREACH_UNIT:-emails}"
+    rc=0; restore home.tar.zst /tmp/home.tar.zst || rc=$?   # legacy single-tenant name
+    if [ "$rc" -eq 0 ]; then
+        tar -I zstd -xf /tmp/home.tar.zst -C "$HOME" || step "warning: home unpack failed"
+        rm -f /tmp/home.tar.zst
+    else
+        step "no home in R2 — first run"
+    fi
 fi
 
-log "running: $*"
-"$@" > "$LEADS" &
-JOB=$!
+# One settings module, one migration graph: bring the schema current before
+# the shim serves anything, so ingest never lands on missing tables. Never
+# fatal: a failed migration is surfaced by /check and the verbs themselves —
+# killing the container here would only hide the reason.
+step "migrating"
+openoutreach migrate --no-input >&2 || step "WARNING: migrate failed ($?); continuing"
+step "migrate done"
 
-# The platform signals PID 1 only; forward it to the job, then sync after it
-# dies. `wait` is interruptible by a trapped signal, which is what makes the
-# trap fire while the job is still running.
-trap 'kill -TERM "$JOB" 2>/dev/null || true' TERM INT
-RC=0
-wait "$JOB" || RC=$?
-trap - TERM INT
-
-log "job exited with $RC"
-sync_up
-exit "$RC"
+# The shim is the container's reason to exist; supervise it rather than exec
+# so a crash at boot is logged (container stdout + boot.log) and retried
+# instead of taking the instance down with no trace. SIGTERM still reaches
+# the shim, which syncs state and exits cleanly.
+term() { [ -n "${SHIM_PID:-}" ] && kill -TERM "$SHIM_PID" 2>/dev/null; wait; exit 0; }
+trap term TERM INT
+step "starting the engine shim on :8080"
+while true; do
+    python /shim.py >&3 2>&4 &
+    SHIM_PID=$!
+    wait "$SHIM_PID" && break
+    step "WARNING: shim exited ($?); restarting in 5s"
+    sleep 5
+done

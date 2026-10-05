@@ -1,258 +1,197 @@
-# Cloudflare — Running OpenOutreach as a Scheduled Job
+# Cloudflare — the multi-tenant outreach engine
 
 > **This is not the install path.** The supported install is `uvx openoutreach find 10` (or
-> `pip install openoutreach`) — see the README quick start. This page is the Cloudflare
-> counterpart of the [Docker guide](./docker.md): running the bounded job unattended on a
-> schedule, without a server of your own.
+> `pip install openoutreach`) — see the README quick start. This page documents what runs on
+> Cloudflare: a **sending and CRM engine** that a calling agent drives over HTTP. It replaced
+> an earlier single-tenant scheduled-find deploy on 2026-10-04.
 >
 > You need a Cloudflare account on the **Workers Paid plan** ($5/month — Containers require
 > it), Docker for image builds, and Node.js for `wrangler`.
 
-> **There is still no web surface.** What Cloudflare hosts is the same one-shot job the
-> Docker image runs — `openoutreach find 10 emails` — on a Cron Trigger instead of a systemd
-> timer. The few HTTP endpoints the deploy adds are for the *operator* (status, manual run,
-> download the CSV); nothing about the product becomes a website.
+## What the engine is — and is not
 
----
+The engine **sends email and remembers**. It deliberately does **not find leads**: the calling
+agent discovers and qualifies people itself, and hands them over through the public ingest
+contract. The split, and why:
 
-## What the deploy is
+| Concern | Owner |
+|---|---|
+| Finding and qualifying leads | the calling agent (voki: its own model + its own data tools) |
+| Writing the openers | the calling agent, via the `draft_pending` protocol |
+| Leads in (JSON Lines, upsert on `lead_id`) | **the engine** — suppression checked at the door |
+| Mailbox, SMTP/IMAP, sending window, daily cap, pacing | **the engine** |
+| The CRM: leads, deals, conversations, mail log, suppression | **the engine** — one SQLite file per workspace |
 
-Everything lives in [`deploy/cloudflare/`](../deploy/cloudflare/):
+Because openers arrive as answers to `draft_pending` (the CLI's `--agent-draft` contract),
+**the engine never needs an LLM key** — no `OUTSEND_AI_MODEL`, no second model bill.
 
-| Piece | What it is | Why |
-|---|---|---|
-| **Worker** (`src/index.ts`) | a Cron Trigger plus four small HTTP endpoints | the scheduler and the operator's remote control |
-| **Container** (`Dockerfile`) | the released package from PyPI, on `python:3.12-slim` | the job itself — same image philosophy as the VM deploy |
-| **Durable Object** | the `OutreachContainer` class, one *named* instance | the mutex: "one job per database, ever" by construction |
-| **R2 bucket** (`openoutreach-crm`) | `db.sqlite3`, `home.tar.zst`, `leads.csv` | the CRM and the model caches between runs |
+The consumers of this design are **workspaces** — today, voki Slack workspaces. Each gets its
+own database; nothing is shared but the image.
+
+## Architecture
 
 ```text
-Cron Trigger ──▶ Worker ──▶ Durable Object "openoutreach"  (the mutex)
-                                  │ starts, with the secrets as env vars
-                                  ▼
-                     Container (standard-1) — one bounded job
-                     container-start: restore state → run → checkpoint → upload
-                                  │ plain HTTP to state.internal
-                                  ▼
-                     R2: db.sqlite3 · home.tar.zst · leads.csv
+voki trusted app (or curl with the service token)
+   │  Authorization: Bearer <OUTREACH_SERVICE_TOKEN>
+   ▼
+openoutreach Worker ── PUT/GET /w/<ws>/config ──► Durable Object storage
+   │                                            (the workspace's OUTSEND_* env)
+   ├─ GET /w/<ws>/db ─────────────────────────► R2  crm/<ws>/db.sqlite3 (served directly)
+   ▼
+Durable Object "workspace id" = the mutex (one run per database, ever)
+   │ starts the container with the stored env + WORKSPACE_ID
+   ▼
+engine container (standard-1) — container-start restores state from R2,
+runs shim.py on :8080 for the life of the instance
+   │ POST /ingest /send /draft /check · GET /pending /crm/*
+   │ http://state.internal/... (the Worker's outbound handler → R2)
+   ▼
+R2 bucket: crm/<ws>/{db.sqlite3, home.tar.gz, job.json}
+   │
+   SMTP/IMAP ► the workspace's mailbox   (egress is plain internet, on purpose)
 ```
 
-The mapping from the VM deploy, piece by piece:
+The rules the first deploy established still hold:
 
-| On the VM (docs/docker.md) | On Cloudflare |
+- **One job per database, ever.** The DO per workspace serializes starts; the shim's run
+  mutex serializes CLI invocations inside the container.
+- **Credentials never enter the container image or R2.** Per-workspace config lives in DO
+  storage and is applied as the container environment at `start()`; the R2 sync rides the
+  Worker's outbound proxy on `state.internal`.
+- **Disk is ephemeral.** The entrypoint restores the workspace's SQLite file and home dir
+  from R2; the shim uploads them back after every change, and on SIGTERM. A hard kill
+  between the last sync and the next start loses that window's writes — and the verbs are
+  resumable, so the caller re-issues them.
+
+## The HTTP surface
+
+`BASE = https://openoutreach.<subdomain>.workers.dev`, auth on everything but `GET /`:
+`Authorization: Bearer $OUTREACH_SERVICE_TOKEN`. `<ws>` is a slug (`^[a-z0-9][a-z0-9_-]{0,63}$`)
+— voki uses the Slack workspace id lowercased.
+
+| Endpoint | What it does |
 |---|---|
-| systemd timer / cron entry | Cron Trigger (`[triggers]` in `wrangler.toml`) |
-| `--env-file` of `OPENOUTFIND_*` / `OUTSEND_*` | Worker secrets, passed in at `start()` |
-| the mounted `./data` volume | the R2 bucket (see the state model below) |
-| `ghcr.io/eracle/openoutreach` image | image built by `wrangler deploy`, in the Cloudflare Registry |
-| "one job per database" by discipline | one *named* container instance — the Durable Object serializes starts |
-| the journal / `docker logs` | Workers observability: dashboard, `wrangler tail` |
+| `PUT /w/<ws>/config` | body `{env: {...}}` — `OUTSEND_*` keys only, values ≤ 20 KB. Stored in the workspace's DO; **stops a running container** so the next start applies it |
+| `GET /w/<ws>/config` | which keys are set (values are never returned) |
+| `POST /w/<ws>/ingest` | body = **JSON Lines**, one record per line — the public pipe. Upserts on `lead_id`, latest-wins; suppression checked and terminal; a malformed line is skipped and counted; a blank `email` is stored, not rejected |
+| `POST /w/<ws>/send` | `{n?: 5 \| "all"}` — starts a sending pass in `--agent-draft` mode (async; poll `/pending`). The pass reads the mail, answers replies, and stops at the first deal needing an opener |
+| `POST /w/<ws>/draft` | `{subject, body}` — answers `draft_pending`; the engine sends it as soon as a mailbox is free (an answer given while guards hold is kept, not thrown away) |
+| `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits, `last_ingest`, `last_check` |
+| `POST /w/<ws>/check` | `outsend check`: what a run needs — including a **real SMTP login** for the mailbox. Use it to verify a config before relying on it |
+| `GET /w/<ws>/crm/leads?limit=` | leads joined with deal state (`Ready`/`Emailed`/`Completed`), outcome, reason, sent-at, chat summary, suppression flag |
+| `GET /w/<ws>/crm/conversations?limit=` | the mail log newest-first, joined to the lead and deal |
+| `GET /w/<ws>/crm/mailbox` | connected mailboxes: hosts, daily limit, `next_send_at` (the learned pacing). No credentials in the response |
+| `GET /w/<ws>/db` | the SQLite file itself, streamed from R2 |
 
----
+The ingest record is the finder's documented JSON shape — send at least `lead_id` (required,
+stable key), `email`, `first_name`, `last_name`, `company`, `title`, `website`,
+`linkedin_url`, and `profile_text` (what an opener is written from). The engine ignores keys
+it does not know.
 
-## The state model — the one real difference
+### The draft loop, end to end
 
-**All container disk on Cloudflare is ephemeral.** When the instance sleeps or is replaced,
-its disk is gone. So the CRM — one SQLite file — lives in R2, and the image's entrypoint
-(`deploy/cloudflare/container-start`) wraps the job in a state sync:
+```text
+POST /w/<ws>/send                → 202 {started}
+GET  /w/<ws>/pending             → phase: draft_pending
+                                    {profile_text, company, title, ...}
+   (the calling agent writes the opener)
+POST /w/<ws>/draft {subject, body} → 202 {started}
+GET  /w/<ws>/pending             → phase: done (or the next draft_pending)
+```
 
-1. **Restore**: download `db.sqlite3` from R2 (a 404 means a fresh install), and unpack
-   `home.tar.zst` into `$HOME` (model caches, so cold starts don't re-download them).
-2. **Run** the job — `openoutreach find <goal> <unit>` by default; `openoutreach run <goal>`
-   when `OPENOUTREACH_SEND=1` (find → ingest → send). Its CSV is captured and uploaded as
-   `leads.csv`; its narration goes to the container logs.
-3. **Upload**: checkpoint the WAL into the main file, put `db.sqlite3` and `home.tar.zst`
-   back in R2, exit with the job's own exit code.
-
-Two properties worth stating plainly:
-
-- **The sync rides the Worker's outbound proxy.** The script speaks plain HTTP to the
-  virtual hostname `state.internal`; the Worker's `outboundByHost` handler resolves that
-  against the R2 binding. The container never holds an R2 credential, and the CRM's bytes
-  never leave Cloudflare's network.
-- **A hard kill loses that run's writes.** The platform sends `SIGTERM` (the script
-  checkpoints and uploads), waits up to 15 minutes, then `SIGKILL`s. A crash inside that
-  window — or a mid-job host failure — loses whatever the job had written since the last
-  successful upload. That is tolerable *by the product's own design*: a goal is "N more
-  than you already have", so the next run picks up where the lost one began. The CSV is
-  uploaded whatever the exit code; a rejected lead never exports, and a lead with no email
-  still does — same rules as anywhere else.
-
-Secrets do **not** live in R2. The wizard never runs in this deploy (there is no TTY), so
-the `SiteConfig` row stays empty and the children read their `OPENOUTFIND_*` / `OUTSEND_*`
-variables fresh from each `start()` — supplied from Worker secrets.
-
----
+A `draft_pending` survives container sleep (it is persisted with the job document and in the
+engine's own tables); a bare `POST /send` re-raises it if the answer was never given.
 
 ## One-time setup
 
 ```bash
 cd deploy/cloudflare
-npm install                       # wrangler, @cloudflare/containers, typescript
-npx wrangler login                # once, if `npx wrangler whoami` says you are not
+npm install
+npx wrangler login                      # once
 npx wrangler r2 bucket create openoutreach-crm
-```
-
-### The secrets
-
-The job's environment is the same vocabulary the Docker deploy takes from `--env-file`
-(`openoutreach/config/models.py` is the mapping). Set each with
-`npx wrangler secret put <NAME>` — a variable that is set is never asked for, and the job
-exits naming any it still lacks, so the fastest path is: set what you have, run the job
-once, read the names it asks for.
-
-| Variable | Needed for | What it is |
-|---|---|---|
-| `OPENOUTFIND_PRODUCT_DOCS` | finding | your product description (markdown) |
-| `OPENOUTFIND_CAMPAIGN_TARGET` | finding | who you are going after, and the outcome |
-| `OPENOUTFIND_AI_MODEL` | finding | `provider:model`, e.g. `anthropic:claude-sonnet-4-5-20250929` |
-| `OPENOUTFIND_LLM_API_KEY` | finding | that provider's key |
-| `OPENOUTFIND_LLM_API_BASE` | openai_compatible only | API base URL |
-| `OPENOUTFIND_BETTERCONTACT_API_KEY` | finding | discovery (free) + email credits (paid) |
-| `OPENOUTFIND_APOLLO_API_KEY` | optional email finder | never stands alone |
-| `OPENOUTFIND_OPERATOR_EMAIL` | finding | keys the contacts store |
-| `OPENOUTFIND_OPERATOR_COUNTRY` | finding | your ISO-3166 jurisdiction (e.g. `US`) |
-| `OUTSEND_MAILBOX_ADDRESS` | sending | the box the mail leaves from |
-| `OUTSEND_MAILBOX_PASSWORD` | sending | its **app password** |
-| `OUTSEND_OPERATOR_NAME` | sending | the name that signs the mail |
-| `OUTSEND_SMTP_HOST` / `_PORT`, `OUTSEND_IMAP_HOST` / `_PORT` | non-Google mailbox | blank for Google Workspace |
-| `OUTSEND_BOOKING_LINK`, `OUTSEND_SIGNATURE`, `OUTSEND_AI_MODEL`, `OUTSEND_LLM_API_KEY`, … | sending | the sender's own copies of the shared answers |
-
-Then one secret of ours:
-
-```bash
-npx wrangler secret put RUN_TOKEN   # e.g. output of: openssl rand -hex 32
-```
-
-`RUN_TOKEN` guards the HTTP endpoints (everything except `GET /`).
-
-### The schedule and the goal
-
-In `wrangler.toml`:
-
-```toml
-[triggers]
-crons = ["0 9 * * 1-5"]       # UTC — align with the mailbox's sending window
-
-[vars]
-OPENOUTREACH_GOAL = "10"      # ten more leads carrying a verified address
-OPENOUTREACH_UNIT = "emails"  # (at most 10 credits)
-OPENOUTREACH_SEND = "0"       # "1" = also mail what was found (the `run` flow)
-```
-
-Sending is **off by default**, for the same reason the CLI keeps spending opt-in: a
-forgotten switch must not be able to send your mail. Turn it on when the pipeline has
-earned it.
-
-### Deploy
-
-```bash
+npx wrangler secret put OUTREACH_SERVICE_TOKEN   # e.g. openssl rand -hex 32
 npx wrangler deploy
 ```
 
-Wrangler builds the image with Docker (the first build takes a few minutes — sklearn,
-onnxruntime and friends), pushes it to the Cloudflare Registry, and deploys the Worker.
-Your endpoints are at `https://openoutreach.<YOUR_SUBDOMAIN>.workers.dev`.
+The image installs the released package from PyPI (`OPENOUTREACH_VERSION` in the Dockerfile);
+`wrangler deploy` builds and pushes it (the first build takes a few minutes) and updates
+running instances with a rollout.
 
-> Containers are not instant after the *first* deploy — the platform provisions instances
-> for a few minutes. The Worker URL answers right away; the first `POST /run` may error
-> until provisioning finishes.
+### Per-workspace configuration
 
----
+The sender's own vocabulary, nothing else (`openoutreach/config/models.py` is the mapping):
+
+| Variable | Required | What it is |
+|---|---|---|
+| `OUTSEND_PRODUCT_DOCS` / `OUTSEND_CAMPAIGN_TARGET` | ✅ | what a message is written from |
+| `OUTSEND_OPERATOR_NAME` / `OUTSEND_OPERATOR_EMAIL` / `OUTSEND_OPERATOR_COUNTRY` | ✅ | who signs; the email is BCC'd on every send |
+| `OUTSEND_MAILBOX_ADDRESS` / `OUTSEND_MAILBOX_PASSWORD` | ✅ | the box to send from, and its **app password** |
+| `OUTSEND_SMTP_HOST/_PORT`, `OUTSEND_IMAP_HOST/_PORT` | non-Google | blank = Gmail defaults |
+| `OUTSEND_BOOKING_LINK`, `OUTSEND_SIGNATURE` | optional | call link; sign-off |
+
+No `OUTSEND_AI_MODEL` — openers arrive through `/draft`.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"env": {"OUTSEND_PRODUCT_DOCS": "...", "OUTSEND_MAILBOX_ADDRESS": "you@co.com", ...}}' \
+  $BASE/w/<ws>/config
+curl -X POST -H "Authorization: Bearer $TOKEN" $BASE/w/<ws>/check   # verifies incl. SMTP login
+```
 
 ## Operating it
 
-`BASE` is your Worker URL; `TOKEN` is `RUN_TOKEN`.
-
 ```bash
-curl $BASE/                                    # what this is (open)
-curl -H "Authorization: Bearer $TOKEN" $BASE/status
-curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/run?goal=5&unit=emails"
-curl -H "Authorization: Bearer $TOKEN" $BASE/leads -o leads.csv
-curl -H "Authorization: Bearer $TOKEN" $BASE/db -o db.sqlite3
+TOKEN=...; BASE=https://openoutreach.appifex-ai.workers.dev; WS=<workspace>
+
+# leads in (from anywhere producing the JSON contract)
+curl -X POST -H "Authorization: Bearer $TOKEN" --data-binary @leads.jsonl $BASE/w/$WS/ingest
+
+# one sending pass, openers by the agent
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{}' $BASE/w/$WS/send
+curl -H "Authorization: Bearer $TOKEN" $BASE/w/$WS/pending          # → draft_pending + fields
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"subject":"...","body":"..."}' $BASE/w/$WS/draft
+
+# the CRM
+curl -H "Authorization: Bearer $TOKEN" "$BASE/w/$WS/crm/leads?limit=20"
+curl -H "Authorization: Bearer $TOKEN" "$BASE/w/$WS/crm/conversations?limit=20"
 ```
 
-- **`GET /status`** — the container state and the last run's exit code and time.
-- **`POST /run`** — start a job now (goal/unit optional; defaults from `wrangler.toml`).
-  Returns `409` if one is already running — the same "one job per database, ever" rule.
-- **`GET /leads`** — the CSV of the last run, in the importer-ready shape (`email`,
-  `first_name`, `last_name`, `company`, `title`, `website`, `linkedin_url`, `reason`, …).
-- **`GET /db`** — the SQLite file itself, for any SQLite client.
-
-**Logs** — the job's narration (stderr) is in the dashboard under
-*Workers & Pages → Containers*, or live:
-
-```bash
-npx wrangler tail
-```
-
-**Cron with no configuration yet** does no harm: the job starts, `find` exits naming the
-variables it lacked, the logs say which — and the state sync still uploads the fresh
-database, so the very first entry in R2 is created by the first run.
-
-### Changing things
-
-- **Schedule or goal**: edit `wrangler.toml`, `npx wrangler deploy` again.
-- **The package version**: bump `OPENOUTREACH_VERSION` in `deploy/cloudflare/Dockerfile`
-  (default: the latest release on PyPI), then redeploy. `wrangler deploy` pushes only the
-  changed image layers; running instances pick the new image up with a rollout.
-- **Tear it all down**:
-  ```bash
-  npx wrangler delete               # the Worker (container image with it)
-  npx wrangler r2 bucket delete openoutreach-crm   # the CRM — your leads; copy first
-  ```
-
----
-
-## Cost
-
-The job runs on a `standard-1` instance (½ vCPU, 4 GiB memory, 8 GB disk — the memory is
-for the embedding model, the disk for the venv). Billing is per 10ms of *running* time; a
-job that isn't running costs nothing.
-
-| Job length | Memory (4 GiB provisioned) | vCPU (½, active) | Disk (8 GB) |
-|---|---|---|---|
-| 30 min/day | 60 GiB-h/mo → ~$0.32 over the 25 included | ~450 min/mo → ~$0.09 over the 375 included | 120 GB-h/mo, included |
-| 2 h/day | 240 GiB-h/mo → ~$1.94 | ~1800 min/mo → ~$1.71 | ~$0.07 |
-
-So: **the $5/month Workers Paid plan, plus well under a dollar for one short job a day.**
-R2 storage for the CRM and caches is pennies (a few GB at $0.015/GB/month); R2 egress is
-free.
-
----
+- **Logs**: dashboard (*Workers & Pages → Containers*) or `npx wrangler tail`. The shim
+  prefixes every line with `[engine:<ws>]`.
+- **Scheduling** is the caller's decision (voki's CronJob scheduler fires sending passes);
+  the engine has no cron of its own.
+- **Cost**: `standard-1` billed only while an instance is up — an instance exists while a
+  workspace is actively running something, sleeps 15 minutes after idle, and restores in
+  seconds when woken. Realistically: the $5 plan plus cents per workspace per day.
+- **Updating**: bump `OPENOUTREACH_VERSION`, `npx wrangler deploy` (layer-cached).
+- **Teardown**: `npx wrangler delete`, then `npx wrangler r2 bucket delete openoutreach-crm`
+  (per-workspace data included — copy `/w/<ws>/db` first if it matters).
 
 ## Notes and limits
 
-- **The image installs from PyPI, not from your checkout** — the build context is
-  `deploy/cloudflare/` and holds no Python sources, and the released package *is* the
-  supported install. To run unreleased code, build and push it explicitly:
-  ```bash
-  docker build -t openoutreach:dev -f compose/openoutreach/Dockerfile .   # from the repo root
-  npx wrangler containers push openoutreach:dev
-  ```
-  …then point `image` in `wrangler.toml` at the printed `registry.cloudflare.com/…`
-  reference. The compose image needs its gosu entrypoint dropped for Cloudflare's
-  non-root runtime — this is why the deploy ships its own Dockerfile.
-- **Placement is global.** Container instances start wherever Cloudflare has capacity
-  pre-warmed; you cannot pin a region. If your jurisdiction cares where lead data is
-  processed, weigh that before putting the CRM in R2.
-- **`enableInternet` stays on, on purpose.** The sender's SMTP/IMAP egress uses ports the
-  outbound proxy cannot carry; only HTTP/HTTPS is interceptable. If you want an allowlist
-  anyway, `deniedHosts` on the `OutreachContainer` class is the hook.
-- **Cold starts re-unpack the caches** (`home.tar.zst`) rather than re-downloading them —
-  the first run is the slow one.
-- **Backups are your job.** `GET /db` gives you the file; the bucket has no versioning
-  unless you turn it on (`wrangler r2 bucket versioning enable openoutreach-crm`).
-
----
+- **Sending is externally visible.** The engine sends when told via `/send`/`/draft`; it has
+  no judgment of its own about consent. The calling agent must apply the ask-first rule (in
+  voki, that lives in the tool layer).
+- **The mailbox reputation is the customer's.** The engine's guards prevent mechanical
+  over-sending (one shared window, cap and pacing for openers *and* follow-ups); they cannot
+  prevent bad copy. Every message carries a `Sent with OpenOutreach` footer — always on.
+- **A lead who never answers gets two more emails**, then the deal closes as `unresponsive`.
+- **Suppression is terminal** — an opted-out address never re-enters through ingest.
+- **Placement is global**; the CRM's R2 bucket sits in one region. Jurisdiction-sensitive
+  workspaces are a deployment question to answer before onboarding.
+- **The app password lives in two places**: the workspace's DO storage (engine config) and
+  the engine's own mailbox row (it is how the provider login works). Both are ours to
+  operate; neither is in the image or the repo.
 
 ## Troubleshooting
 
 | Symptom | What it means |
 |---|---|
-| job exits naming `OPENOUTFIND_*` / `OUTSEND_*` variables | exactly what it says: `npx wrangler secret put` each name, then `POST /run` again |
-| `state store unreachable` in the logs | the container could not reach `state.internal` — the outbound handler did not run; check that `src/index.ts` still exports `ContainerProxy` |
-| `401` from the endpoints | wrong `RUN_TOKEN` (or none set — everything but `GET /` requires it) |
-| deploy fails asking for a paid plan | Containers need Workers Paid ($5/month) |
-| a run's leads vanished | a hard stop between checkpoint and upload — see the state model; the next run continues from the last good upload |
-| `POST /run` returns `409` | a job is already running — check `GET /status` |
+| `/pending` shows an error naming `OUTSEND_*` variables | the workspace config is incomplete — `PUT /config` the names it lists |
+| `409 {"error":"busy"}` | a run already holds this workspace's database — poll `/pending` |
+| `409 {"error":"no_pending_draft"}` | `/draft` without a pending draft — `/send` first |
+| `state store unreachable` in logs | the container could not reach `state.internal` — check that `src/index.ts` still exports `ContainerProxy` |
+| `401` | wrong service token |
+| `workspace_not_configured` | `PUT /w/<ws>/config` before anything else |
