@@ -45,16 +45,53 @@ export interface Env {
   OUTREACH_SERVICE_TOKEN?: string;
 }
 
+/**
+ * The container's only way to reach R2: plain HTTP to a virtual hostname,
+ * resolved here in the Workers runtime. Keys arrive already prefixed with
+ * the workspace by the shim (its WORKSPACE_ID is set by the container class,
+ * never by a request).
+ */
+async function stateStore(request: Request, env: Env): Promise<Response> {
+  const key = new URL(request.url).pathname.replace(/^\/+/, "");
+  const segment = /^[A-Za-z0-9][A-Za-z0-9/._-]*$/;
+  if (!key || !segment.test(key) || key.split("/").includes("..")) {
+    return new Response("bad key", { status: 400 });
+  }
+  try {
+    if (request.method === "GET") {
+      const object = await env.CRM.get(key);
+      console.log("state", "GET", key, object ? object.size : 404);
+      if (!object) return new Response("not found", { status: 404 });
+      return new Response(object.body, {
+        headers: {
+          "content-type": "application/octet-stream",
+          etag: object.httpEtag,
+        },
+      });
+    }
+    if (request.method === "PUT") {
+      // Buffered, not streamed: R2 rejects a stream of unknown length,
+      // and a body arriving through the interception proxy carries none.
+      const body = await request.arrayBuffer();
+      await env.CRM.put(key, body, {
+        httpMetadata: { contentType: "application/octet-stream" },
+      });
+      console.log("state", "PUT", key, body.byteLength);
+      return new Response(null, { status: 204 });
+    }
+    return new Response("method not allowed", { status: 405 });
+  } catch (error) {
+    // Logged here, because the caller in the container cannot be heard.
+    console.error("state", request.method, key, "failed:", String(error));
+    return new Response(`state store error: ${error}`, { status: 502 });
+  }
+}
+
 export class OutreachContainer extends Container {
   /** The shim's HTTP surface; readiness is the port accepting connections. */
   defaultPort = 8080;
   requiredPorts = [8080];
-  /**
-   * Explicit on purpose: this app's instances did not honor the image's
-   * baked-in ENTRYPOINT (they exited instantly with no output), while the
-   * same image runs fine when the entrypoint is passed at start. Declaring
-   * it here makes every start — including ensureStarted — pass it.
-   */
+  /** The image's own ENTRYPOINT, stated so every start passes it explicitly. */
   entrypoint = ["/container-start"];
   /** Idle instances sleep; the shim has already synced state by then. */
   sleepAfter = "15m";
@@ -64,12 +101,10 @@ export class OutreachContainer extends Container {
   private starting: Promise<void> | null = null;
 
   /**
-   * The SDK tracks the activity deadline in memory (`sleepAfterMs`). After
-   * the Durable Object is evicted — which can happen within the 1s startup
-   * alarm — that field resets to 0 and the default `onActivityExpired()`
-   * stops a healthy container seconds after it started. Derive liveness
-   * from the persisted state instead: only sleep once the container has
-   * genuinely been idle for `sleepAfter`.
+   * The SDK tracks the activity deadline in Durable Object memory
+   * (`sleepAfterMs`), and the default `onActivityExpired()` stops the
+   * container on it alone. Derive liveness from the persisted state too:
+   * only sleep once the container has genuinely been idle for `sleepAfter`.
    */
   override async onActivityExpired(): Promise<void> {
     const state = await this.getState();
@@ -83,40 +118,6 @@ export class OutreachContainer extends Container {
       await this.stop();
     }
   }
-
-  /**
-   * The container's only way to reach R2: plain HTTP to a virtual hostname,
-   * resolved here in the Workers runtime. Keys arrive already prefixed with
-   * the workspace by the shim (its WORKSPACE_ID is set by this class, never
-   * by a request).
-   */
-  static outboundByHost = {
-  [STATE_HOST]: async (request: Request, env: Env): Promise<Response> => {
-    const key = new URL(request.url).pathname.replace(/^\/+/, "");
-    const segment = /^[A-Za-z0-9][A-Za-z0-9/._-]*$/;
-    if (!key || !segment.test(key) || key.split("/").includes("..")) {
-      return new Response("bad key", { status: 400 });
-    }
-    if (request.method === "GET") {
-      const object = await env.CRM.get(key);
-      if (!object) return new Response("not found", { status: 404 });
-      return new Response(object.body, {
-        headers: {
-          "content-type": "application/octet-stream",
-          etag: object.httpEtag,
-        },
-      });
-    }
-    if (request.method === "PUT") {
-      if (!request.body) return new Response("body required", { status: 400 });
-      await env.CRM.put(key, request.body, {
-        httpMetadata: { contentType: "application/octet-stream" },
-      });
-      return new Response(null, { status: 204 });
-    }
-    return new Response("method not allowed", { status: 405 });
-  },
-  };
 
   // ── per-workspace configuration, held in Durable Object storage ──
 
@@ -135,6 +136,20 @@ export class OutreachContainer extends Container {
       await this.stop();
     }
     return { ok: true, keys: Object.keys(env).length, restarted: running };
+  }
+
+  /**
+   * Called by the Worker (trusted): drop this workspace's configuration and
+   * kill its container. SIGKILL, not SIGTERM — a graceful stop would sync
+   * state back to R2 just as the Worker deletes it.
+   */
+  async forget(): Promise<{ configured: boolean; wasRunning: boolean }> {
+    const configured = (await this.stored()) !== null;
+    const state = await this.getState();
+    const wasRunning = state.status === "running" || state.status === "healthy" || state.status === "stopping";
+    if (this.ctx.container?.running) await this.destroy();
+    await this.ctx.storage.delete("config");
+    return { configured, wasRunning };
   }
 
   async getConfig(): Promise<{ ws: string; keys: string[] } | null> {
@@ -163,21 +178,6 @@ export class OutreachContainer extends Container {
     await this.starting;
   }
 
-  /** Debug: start with a long sleep so an operator can SSH in. */
-  async debugSleep(): Promise<void> {
-    await this.start({ entrypoint: ["/bin/sh", "-c", "sleep 900"] });
-  }
-
-  /** Debug: heartbeat + the real entrypoint, reporting via the public URL. */
-  async debugNet(): Promise<void> {
-    await this.start({
-      entrypoint: ["/bin/sh", "-c", [
-        `(while true; do curl -sS -m 5 "https://openoutreach.appifex-ai.workers.dev/net-report?hb=\$(date +%s)" >/dev/null 2>&1; sleep 5; done) &`,
-        `exec /container-start`,
-      ].join(" ")],
-    });
-  }
-
   /** Internal ingress from the Worker: forward to the shim on :8080. */
   override async fetch(request: Request): Promise<Response> {
     const config = await this.stored();
@@ -191,6 +191,15 @@ export class OutreachContainer extends Container {
     return this.containerFetch(request);
   }
 }
+
+// Registered by assignment, never as a `static outboundByHost = …` class
+// field: a class field is *defined* on the subclass, shadowing the SDK's
+// static setter, so the handler never reaches the registry ContainerProxy
+// reads. The host is still intercepted (the constructor sees the own
+// property) and the request falls through to the public internet, where
+// state.internal does not resolve — every restore fails and every upload
+// vanishes. That was the whole 2026-10-04 "platform" incident.
+OutreachContainer.outboundByHost = { [STATE_HOST]: stateStore };
 
 // ── the Worker's public surface ─────────────────────────────────────
 
@@ -222,6 +231,7 @@ export default {
         endpoints: [
           "PUT  /w/<ws>/config            — the OUTSEND_* environment for this workspace",
           "GET  /w/<ws>/config            — which keys are set (values never returned)",
+          "DELETE /w/<ws>                 — forget the workspace: config, container, R2 state",
           "POST /w/<ws>/ingest            — JSON Lines body: leads in, upserted on lead_id",
           "POST /w/<ws>/send              — {n?} start a sending pass (--agent-draft)",
           "POST /w/<ws>/draft             — {subject, body} answer the pending draft",
@@ -284,6 +294,23 @@ export default {
       return new Response("method not allowed", { status: 405 });
     }
 
+    // Forgetting a workspace: config, container and every R2 object under
+    // its prefix. Irreversible — the database goes with it.
+    if (path === "/" && request.method === "DELETE") {
+      const forgotten = await getContainer(env.OUTREACH, ws).forget();
+      let deleted = 0;
+      let cursor: string | undefined;
+      do {
+        const page = await env.CRM.list({ prefix: `crm/${ws}/`, cursor });
+        if (page.objects.length > 0) {
+          await env.CRM.delete(page.objects.map((o) => o.key));
+          deleted += page.objects.length;
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return Response.json({ ...forgotten, objectsDeleted: deleted });
+    }
+
     // The database file is served straight from R2 — no container needed.
     if (path === "/db" && request.method === "GET") {
       const object = await env.CRM.get(`crm/${ws}/db.sqlite3`);
@@ -291,32 +318,6 @@ export default {
       return new Response(object.body, {
         headers: { "content-type": "application/octet-stream", etag: object.httpEtag },
       });
-    }
-
-    // Debug route: start this workspace's container with a shell entrypoint
-    // so `wrangler containers ssh` can get in and run /container-start by
-    // hand. Not part of the engine contract; remove once boot is understood.
-    if (path === "/debug-sleep" && request.method === "POST") {
-      const stub = getContainer(env.OUTREACH, ws);
-      const config = await stub.getConfig();
-      if (!config) return Response.json({ error: "workspace_not_configured" }, { status: 404 });
-      await stub.debugSleep();
-      return Response.json({ started: true, entrypoint: "sleep 900" });
-    }
-
-    // Debug: network probe receiver — the container reports its egress test
-    // results here through the public internet path. Remove once boot works.
-    if (url.pathname === "/net-report") {
-      console.log("NET-REPORT", url.search);
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/debug-net" && request.method === "POST") {
-      const stub = getContainer(env.OUTREACH, ws);
-      const config = await stub.getConfig();
-      if (!config) return Response.json({ error: "workspace_not_configured" }, { status: 404 });
-      await stub.debugNet();
-      return Response.json({ started: true });
     }
 
     return forwardToWorkspace(request, env, ws, path);

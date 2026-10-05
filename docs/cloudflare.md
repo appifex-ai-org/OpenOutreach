@@ -5,6 +5,10 @@
 > Cloudflare: a **sending and CRM engine** that a calling agent drives over HTTP. It replaced
 > an earlier single-tenant scheduled-find deploy on 2026-10-04.
 >
+> **Production status (2026-10-05):** verified end to end in production. The 2026-10-04
+> outage and its root cause — an outbound handler that was never registered — are in
+> [cloudflare-findings.md](cloudflare-findings.md).
+>
 > You need a Cloudflare account on the **Workers Paid plan** ($5/month — Containers require
 > it), Docker for image builds, and Node.js for `wrangler`.
 
@@ -77,11 +81,12 @@ The rules the first deploy established still hold:
 | `POST /w/<ws>/send` | `{n?: 5 \| "all"}` — starts a sending pass in `--agent-draft` mode (async; poll `/pending`). The pass reads the mail, answers replies, and stops at the first deal needing an opener |
 | `POST /w/<ws>/draft` | `{subject, body}` — answers `draft_pending`; the engine sends it as soon as a mailbox is free (an answer given while guards hold is kept, not thrown away) |
 | `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits, `last_ingest`, `last_check` |
-| `POST /w/<ws>/check` | `outsend check`: what a run needs — including a **real SMTP login** for the mailbox. Use it to verify a config before relying on it |
+| `POST /w/<ws>/check` | `outsend check` as an `--agent-draft` pass sees it (no model asked for): what a run needs — including a **real SMTP login** for the mailbox. Use it to verify a config before relying on it |
 | `GET /w/<ws>/crm/leads?limit=` | leads joined with deal state (`Ready`/`Emailed`/`Completed`), outcome, reason, sent-at, chat summary, suppression flag |
 | `GET /w/<ws>/crm/conversations?limit=` | the mail log newest-first, joined to the lead and deal |
 | `GET /w/<ws>/crm/mailbox` | connected mailboxes: hosts, daily limit, `next_send_at` (the learned pacing). No credentials in the response |
 | `GET /w/<ws>/db` | the SQLite file itself, streamed from R2 |
+| `DELETE /w/<ws>` | forget the workspace: its config, its container (killed, so nothing syncs back) and every object under `crm/<ws>/` — **irreversible** |
 
 The ingest record is the finder's documented JSON shape — send at least `lead_id` (required,
 stable key), `email`, `first_name`, `last_name`, `company`, `title`, `website`,
