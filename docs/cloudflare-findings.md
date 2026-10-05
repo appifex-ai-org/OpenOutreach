@@ -70,8 +70,10 @@ logs every state request and failure — a failure there is otherwise silent,
 because nothing in the container can be heard.
 
 **Upstream:** the README's own example has this defect under native class
-fields; worth reporting to `cloudflare/workers-sdk` (or fixing the SDK to
-read the static property directly instead of a setter-fed registry).
+fields. Already reported for `static outbound` as
+[cloudflare/containers#247](https://github.com/cloudflare/containers/issues/247);
+the `outboundByHost` case — which forwards to the public internet instead
+of failing closed — is added there as a comment.
 
 **Why it was hard to see:** the tail showed the intercepted requests as
 `Ok` — that is the proxy invocation succeeding, not the handler — and the
@@ -126,9 +128,12 @@ about the platform behind it.
 - **The R2 boot transcript** (`crm/<ws>/boot.log`) stays: once the handler
   was registered it showed the whole boot on the first try.
 
-## 6. Open items
+## 6. Cleanup (done 2026-10-05)
 
-1. **Report the class-field registration defect upstream** (§2).
-2. **Cleanup** — debug workspace prefixes in `openoutreach-crm` (`crm/dbg*`,
-   `crm/e2e-*`, `crm/probe-*`, …) and the superseded `openoutreach` Worker,
-   now that the engine is confirmed.
+- R2 `openoutreach-crm` emptied of probe data. The debug workspaces from
+  the investigation (`crm/dbg*`, `crm/e2e-*`, …) had never been written —
+  the same unregistered handler dropped their uploads.
+- The superseded single-tenant Worker `openoutreach` and its container
+  application deleted.
+- `OUTREACH_SERVICE_TOKEN` rotated; the operator copy is
+  `~/.openoutreach-service-token.txt` (mode 600).
