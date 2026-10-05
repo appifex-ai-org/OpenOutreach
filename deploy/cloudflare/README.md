@@ -5,6 +5,9 @@ shortest path to a working deploy. The engine sends email and holds the CRM; the
 agent (voki) finds/qualifies leads, ingests them as JSON Lines, and writes openers through
 the `draft_pending` protocol.
 
+> **Status (2026-10-05):** production containers are blocked by a platform issue — see
+> [docs/cloudflare-findings.md](../../docs/cloudflare-findings.md) before deploying.
+
 ```bash
 npm install
 npx wrangler login                                        # once

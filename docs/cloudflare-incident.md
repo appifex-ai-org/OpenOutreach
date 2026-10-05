@@ -3,6 +3,9 @@
 Status: **the multi-tenant engine is complete and verified locally end to end;
 production containers are blocked by a Cloudflare platform behavior, under
 investigation.** This file is the evidence trail and the support-case text.
+The full engineering postmortem — including the two bugs found in our code and
+the elimination matrix that isolates the platform issue — is
+[cloudflare-findings.md](cloudflare-findings.md).
 
 ## What works (verified)
 

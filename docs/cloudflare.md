@@ -5,6 +5,12 @@
 > Cloudflare: a **sending and CRM engine** that a calling agent drives over HTTP. It replaced
 > an earlier single-tenant scheduled-find deploy on 2026-10-04.
 >
+> **Production status (2026-10-05):** the engine is complete and verified locally on arm64
+> and amd64, but production containers are currently blocked by a Cloudflare platform
+> issue — see [cloudflare-findings.md](cloudflare-findings.md) (postmortem) and
+> [cloudflare-incident.md](cloudflare-incident.md) (support case). The HTTP contract below
+> is final and safe to build against.
+>
 > You need a Cloudflare account on the **Workers Paid plan** ($5/month — Containers require
 > it), Docker for image builds, and Node.js for `wrangler`.
 
