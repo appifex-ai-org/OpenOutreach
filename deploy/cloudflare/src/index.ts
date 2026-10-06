@@ -188,10 +188,16 @@ function parseSender(value: unknown): Sender {
   const v = object(value, "sender");
   const email = text(v.email, "sender.email", 320, false);
   if (email && !ADDRESS_PATTERN.test(email)) throw new BadRequest("sender.email is not an email address");
+  // The sending window (08:00–20:00, weekdays) is kept in this country's time; the
+  // sender reads an ISO 3166 alpha-2 code and silently falls back to UTC otherwise.
+  const country = text(v.country, "sender.country", 60, false)?.toUpperCase();
+  if (country && !/^[A-Z]{2}$/.test(country)) {
+    throw new BadRequest("sender.country must be an ISO 3166 alpha-2 code, e.g. US");
+  }
   return {
     name: text(v.name, "sender.name", 200)!,
     email: email?.toLowerCase(),
-    country: text(v.country, "sender.country", 60, false),
+    country,
   };
 }
 
