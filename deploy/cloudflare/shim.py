@@ -290,6 +290,19 @@ def finish_cli(code: int, stdout: str, stderr: str) -> dict:
             "error": error}
 
 
+def caller_lead_id(public_id: str | None) -> str | None:
+    """The caller's own lead_id for the sender's public id (its LinkedIn URL, else
+    its email, else "lead:<id>"), so a caller matches a pending draft on the key it
+    ingested with rather than re-deriving the sender's."""
+    if not public_id:
+        return None
+    if public_id.startswith("lead:"):
+        return public_id[len("lead:"):]
+    rows = query("SELECT lead_id FROM outsend_leads_lead WHERE linkedin_url = ? OR email = ? "
+                 "ORDER BY linkedin_url = ? DESC LIMIT 1", (public_id, public_id, public_id))
+    return rows[0]["lead_id"] if rows else None
+
+
 def background(verb: str, args: list[str], stdin_text: str | None = None) -> None:
     def work() -> None:
         acquired = RUN_MUTEX.acquire(timeout=5)
@@ -315,6 +328,7 @@ def background(verb: str, args: list[str], stdin_text: str | None = None) -> Non
             error = result.get("error")
             if error and error.get("type") == "draft_pending":
                 phase = "draft_pending"
+                error["caller_lead_id"] = caller_lead_id(error.get("lead_id"))
             elif result["exit"] != 0:
                 # The orchestrator renders send failures as one plain line
                 # (no JSON object), so a non-zero exit without a parsed error
