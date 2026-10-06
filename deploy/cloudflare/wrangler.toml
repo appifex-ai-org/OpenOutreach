@@ -16,10 +16,10 @@ enabled = true
 
 # The engine container. standard-1 (½ vCPU, 4 GiB, 8 GB disk) is roomy for
 # what is now a sender + CRM; billing stops when the instance sleeps.
-# Image: built and pushed with `npx wrangler containers build --push -t openoutreach-engine:v5 .`
+# Image: built and pushed with `npx wrangler containers build --push -t openoutreach-engine:v6 .`
 [[containers]]
 class_name = "OutreachContainer"
-image = "registry.cloudflare.com/5db6a7cf9dc844657c4b9ce8eb7da202/openoutreach-engine:v5"
+image = "registry.cloudflare.com/5db6a7cf9dc844657c4b9ce8eb7da202/openoutreach-engine:v6"
 instance_type = "standard-1"
 
 # The named-instance binding: getContainer(OUTREACH, <workspaceId>) is both
@@ -39,7 +39,15 @@ storage = "sqlite"
 binding = "CRM"
 bucket_name = "openoutreach-crm"
 
+# The model behind llm.internal — follow-ups and replies (openers come from the
+# caller). Any OpenAI-compatible Chat Completions endpoint; this is the CLI proxy
+# Voki itself runs on.
+[vars]
+LLM_BASE_URL = "https://cliproxy.appifex.ai/v1"
+LLM_MODEL = "gpt-6.1-sol"
+
 # Secrets (npx wrangler secret put <NAME>):
 #   OUTREACH_SERVICE_TOKEN — the bearer token the calling agent presents.
+#   LLM_API_TOKEN          — the bearer token for LLM_BASE_URL; never enters a container.
 # Per-workspace configuration arrives via PUT /w/<ws>/config and is held in
 # each workspace's Durable Object storage, applied as the container env.
