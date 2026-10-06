@@ -23,6 +23,16 @@ RUN pip install uv
 RUN uv venv /opt/venv \
     && VIRTUAL_ENV=/opt/venv uv pip install --no-cache "openoutreach==${OPENOUTREACH_VERSION}"
 
+# openoutsend (0.1.36–0.1.39) builds OpenAI-style models with `OpenAIModel`, a
+# pydantic-ai 1.x name that no 2.x release has — and it requires pydantic-ai 2.x,
+# so every openai/openai_compatible model fails with an ImportError (follow-ups
+# and replies then fail silently, counted per deal). Rename it to the 2.x class
+# until the sender ships the fix; the import check fails the build if the patch
+# stops applying.
+RUN F=$(/opt/venv/bin/python -c "import cold_outreach.core.llm as m; print(m.__file__)") \
+    && sed -i 's/\bOpenAIModel\b/OpenAIChatModel/g' "$F" \
+    && /opt/venv/bin/python -c "from cold_outreach.core.llm import build_llm_model as b; b('openai_compatible:probe', 'k', 'http://llm.internal/v1')"
+
 # ── Stage 2: runtime ──────────────────────────────────────────────
 FROM python:3.12-slim-bookworm AS runtime
 COPY --from=deps /opt/venv /opt/venv

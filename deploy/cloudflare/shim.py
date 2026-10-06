@@ -181,13 +181,7 @@ def pending_document() -> dict:
 # lands in the one database.
 _INGEST = ("import os,sys; os.environ['DJANGO_SETTINGS_MODULE']='openoutreach.settings'; "
            "from cold_outreach.__main__ import main; sys.exit(main([]))")
-# The sender's `check` verb always asks for a model (openoutsend 0.1.36 does
-# not pass --agent-draft through to its readiness check), but this engine only
-# ever sends with --agent-draft, so it checks what that pass checks: the same
-# check_ready, with the model left out — exactly as `send --agent-draft` calls it.
-_CHECK = ("import os,sys,functools; os.environ['DJANGO_SETTINGS_MODULE']='openoutreach.settings'; "
-          "import cold_outreach.first_run as fr; "
-          "fr.check_ready = functools.partial(fr.check_ready, agent_draft_active=True); "
+_CHECK = ("import os,sys; os.environ['DJANGO_SETTINGS_MODULE']='openoutreach.settings'; "
           "from cold_outreach.__main__ import main; sys.exit(main(['check']))")
 
 

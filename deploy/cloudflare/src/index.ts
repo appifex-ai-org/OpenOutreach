@@ -9,7 +9,9 @@
 // The caller discovers and qualifies leads itself and hands them over
 // through the documented ingest contract (JSON Lines, upserted on lead_id,
 // suppression checked at the door). Openers are written by the caller too,
-// through the draft_pending protocol — the engine never needs an LLM key.
+// through the draft_pending protocol. Follow-ups and replies are the
+// sender's own model calls, served through llm.internal: the container holds
+// no model credential, the Worker adds it.
 //
 // The API speaks in a workspace's own terms — a sender, a campaign, a pool
 // of mailboxes — and this file is the one place that translates them into the
@@ -33,6 +35,8 @@ export { ContainerProxy };
 
 /** Virtual hostname the shim's state sync talks to; routed to R2. */
 const STATE_HOST = "state.internal";
+/** Virtual hostname the sender's model client talks to; routed to LLM_BASE_URL. */
+const LLM_HOST = "llm.internal";
 
 /** Workspace ids: slack-style slugs or voki's cuids, safe as R2 key segments and DO names. */
 const WS_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -101,7 +105,7 @@ function translate(text: string): string {
 }
 
 /** The sender's environment for this workspace — the only place OUTSEND_* is spelled. */
-function environmentFor(w: Workspace): Record<string, string> {
+function environmentFor(w: Workspace, model: string | undefined): Record<string, string> {
   const env: Record<string, string> = { WORKSPACE_ID: w.ws };
   const set = (key: string, value: string | undefined) => {
     if (value) env[key] = value;
@@ -112,6 +116,13 @@ function environmentFor(w: Workspace): Record<string, string> {
   set("OUTSEND_PRODUCT_DOCS", w.campaign?.product);
   set("OUTSEND_CAMPAIGN_TARGET", w.campaign?.target);
   set("OUTSEND_BOOKING_LINK", w.campaign?.booking_link);
+  // The model for follow-ups and replies, behind llm.internal; the key is a
+  // placeholder the sender requires — the Worker replaces it.
+  if (model) {
+    env.OUTSEND_AI_MODEL = `openai_compatible:${model}`;
+    env.OUTSEND_LLM_API_BASE = `http://${LLM_HOST}/v1`;
+    env.OUTSEND_LLM_API_KEY = "engine";
+  }
   // Not the sender's one-box variables: the shim reconciles the whole pool.
   env.ENGINE_MAILBOXES = JSON.stringify(
     Object.entries(w.mailboxes).map(([address, box]) => ({ address, ...box })),
@@ -311,11 +322,58 @@ export interface Env {
   OUTREACH: DurableObjectNamespace<OutreachContainer>;
   CRM: R2Bucket;
   OUTREACH_SERVICE_TOKEN?: string;
+  /** OpenAI-compatible base URL and model for follow-ups and replies. */
+  LLM_BASE_URL?: string;
+  LLM_MODEL?: string;
+  /** Secret: the bearer token for LLM_BASE_URL. Never enters a container. */
+  LLM_API_TOKEN?: string;
+}
+
+/**
+ * The sender's model calls: Chat Completions only, on the configured model,
+ * with the credential added here. The container's own key is a placeholder
+ * and its choice of model is overridden, so a container can spend nothing
+ * but follow-ups and replies on the one model this engine runs.
+ */
+async function modelProxy(request: Request, env: Env, ctx: OutboundHandlerContext): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") {
+    return Response.json({ error: { message: "only POST /v1/chat/completions" } }, { status: 404 });
+  }
+  if (!env.LLM_BASE_URL || !env.LLM_MODEL || !env.LLM_API_TOKEN) {
+    return Response.json({ error: { message: "the engine has no model configured" } }, { status: 503 });
+  }
+  let payload: Record<string, unknown>;
+  try {
+    payload = await request.json();
+  } catch {
+    return Response.json({ error: { message: "body must be JSON" } }, { status: 400 });
+  }
+  payload.model = env.LLM_MODEL;
+  const started = Date.now();
+  const upstream = await fetch(`${env.LLM_BASE_URL.replace(/\/+$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${env.LLM_API_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await upstream.text();
+  let usage: unknown = null;
+  try {
+    usage = (JSON.parse(text) as { usage?: unknown }).usage ?? null;
+  } catch {
+    // a non-JSON error body is passed through as-is
+  }
+  // Per-container attribution (the DO id names the workspace via idFromName).
+  console.log("model", ctx.containerId, upstream.status, `${Date.now() - started}ms`, JSON.stringify(usage));
+  return new Response(text, {
+    status: upstream.status,
+    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+  });
 }
 
 // ── the per-workspace container ─────────────────────────────────────
 
-export class OutreachContainer extends Container {
+export class OutreachContainer extends Container<Env> {
   /** The shim's HTTP surface; readiness is the port accepting connections. */
   defaultPort = 8080;
   requiredPorts = [8080];
@@ -443,7 +501,7 @@ export class OutreachContainer extends Container {
         // monitor wait until the instance stops. Cold boots legitimately take
         // tens of seconds (restore + migrate + mailbox logins) before :8080 answers.
         await this.startAndWaitForPorts({
-          startOptions: { envVars: environmentFor(workspace) },
+          startOptions: { envVars: environmentFor(workspace, this.env.LLM_API_TOKEN ? this.env.LLM_MODEL : undefined) },
           cancellationOptions: { portReadyTimeoutMS: 120_000, waitInterval: 1_000 },
         });
       })().finally(() => {
@@ -473,7 +531,7 @@ export class OutreachContainer extends Container {
 // property) and the request falls through to the public internet, where
 // state.internal does not resolve — every restore fails and every upload
 // vanishes. That was the whole 2026-10-04 "platform" incident.
-OutreachContainer.outboundByHost = { [STATE_HOST]: stateStore };
+OutreachContainer.outboundByHost = { [STATE_HOST]: stateStore, [LLM_HOST]: modelProxy };
 
 // ── the Worker's public surface ─────────────────────────────────────
 

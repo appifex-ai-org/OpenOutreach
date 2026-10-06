@@ -6,7 +6,7 @@
 > an earlier single-tenant scheduled-find deploy on 2026-10-04.
 >
 > **Production status (2026-10-06):** verified end to end in production, including a real
-> send: onboarding with a mailbox whose SMTP login the engine checked, `/check` ready, lead
+> send and a model-written reply to a prospect's threaded answer (through `llm.internal`): onboarding with a mailbox whose SMTP login the engine checked, `/check` ready, lead
 > ingest, a sending pass that read the inbox over IMAP and stopped at `draft_pending`, the
 > agent's opener sent over SMTP, the CRM showing the lead `Emailed`, and the message read
 > back from the receiving mailbox with its sign-off, opt-out line and footer. The test
@@ -27,12 +27,24 @@ contract. The split, and why:
 |---|---|
 | Finding and qualifying leads | the calling agent (voki: its own model + its own data tools) |
 | Writing the openers | the calling agent, via the `draft_pending` protocol |
+| Follow-ups and replies | **the engine**, with the model behind `llm.internal` |
 | Leads in (JSON Lines, upsert on `lead_id`) | **the engine** — suppression checked at the door |
 | Mailbox, SMTP/IMAP, sending window, daily cap, pacing | **the engine** |
 | The CRM: leads, deals, conversations, mail log, suppression | **the engine** — one SQLite file per workspace |
 
-Because openers arrive as answers to `draft_pending` (the CLI's `--agent-draft` contract),
-**the engine never needs an LLM key** — no model setting, no second model bill.
+Openers arrive as answers to `draft_pending` (the CLI's `--agent-draft` contract), but
+`--agent-draft` covers the opener only: **follow-ups and replies are the sender's own model
+calls.** The container reaches that model at `http://llm.internal/v1` (Chat Completions, as
+`openai_compatible:<LLM_MODEL>`); the Worker answers that hostname, forces `LLM_MODEL`, and
+adds `LLM_API_TOKEN` — so, like the R2 credentials, the model credential never enters a
+container. Today that is the CLI proxy Voki runs on (`gpt-6.1-sol`), set in `wrangler.toml`
+`[vars]`. Every call is logged with the calling container and its token usage.
+
+The image patches one sender bug at build time: openoutsend (0.1.36–0.1.39) builds
+OpenAI-style models with `OpenAIModel`, a pydantic-ai 1.x name absent from every 2.x release
+it requires, so without the patch every follow-up and reply fails silently (counted per deal).
+The Dockerfile's import check fails the build if the patch stops applying; drop it once the
+sender is fixed upstream.
 
 The consumers of this design are **workspaces** — today, voki Slack workspaces. Each gets its
 own database; nothing is shared but the image.
@@ -111,7 +123,7 @@ daily capacity, and a thread always continues from the box that opened it.
 | `POST /w/<ws>/send` | `{n?: 5 \| "all"}` — starts a sending pass in `--agent-draft` mode (async; poll `/pending`). The pass reads the mail, answers replies, and stops at the first deal needing an opener |
 | `POST /w/<ws>/draft` | `{subject, body}` — answers `draft_pending`; the engine sends it as soon as a mailbox is free (an answer given while guards hold is kept, not thrown away) |
 | `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits, `last_ingest`, `last_check` |
-| `POST /w/<ws>/check` | what an `--agent-draft` pass needs (no model is asked for), reported in the API's field names (`set mailboxes`) |
+| `POST /w/<ws>/check` | what a pass needs, including one ping of the model, reported in the API's field names (`set mailboxes`) |
 | `GET /w/<ws>/crm/leads?limit=` | leads joined with deal state (`Ready`/`Emailed`/`Completed`), outcome, reason, sent-at, chat summary, suppression flag |
 | `GET /w/<ws>/crm/conversations?limit=` | the mail log newest-first, joined to the lead and deal |
 | `GET /w/<ws>/db` | the SQLite file itself, streamed from R2 — mailbox passwords blanked |
@@ -143,6 +155,7 @@ npm install
 npx wrangler login                      # once
 npx wrangler r2 bucket create openoutreach-crm
 npx wrangler secret put OUTREACH_SERVICE_TOKEN   # e.g. openssl rand -hex 32
+npx wrangler secret put LLM_API_TOKEN            # the bearer token for LLM_BASE_URL
 npx wrangler deploy
 ```
 
