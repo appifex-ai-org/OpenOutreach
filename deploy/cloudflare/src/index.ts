@@ -631,6 +631,11 @@ async function route(request: Request, env: Env, ws: string, path: string): Prom
     });
   }
 
+  // Replies wait for the owner: list them, then send (optionally edited) or dismiss.
+  if (path === "/replies" && method === "GET") return forwardToWorkspace(request, env, ws, "/replies");
+  const review = path.match(/^\/replies\/(\d+)$/);
+  if (review && method === "POST") return forwardToWorkspace(request, env, ws, `/replies/${review[1]}`);
+
   const shimPath = SHIM_ROUTES[`${method} ${path}`];
   if (shimPath) return forwardToWorkspace(request, env, ws, shimPath);
   return Response.json({ error: "not_found" }, { status: 404 });
@@ -656,6 +661,8 @@ export default {
           "POST   /w/<ws>/leads               — JSON Lines body: leads in, upserted on lead_id",
           "POST   /w/<ws>/send                — {n?} start a sending pass (--agent-draft)",
           "POST   /w/<ws>/draft               — {subject, body} answer the pending draft",
+          "GET    /w/<ws>/replies             — prospects' replies waiting for the owner, with a suggested answer",
+          "POST   /w/<ws>/replies/<id>        — {action: send|dismiss, body?} — send (edited) or dismiss",
           "GET    /w/<ws>/pending             — job phase, draft payload, last ingest/check",
           "POST   /w/<ws>/check               — verify the workspace can send",
           "GET    /w/<ws>/crm/leads           — leads with deal state and suppression",
