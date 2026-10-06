@@ -96,16 +96,35 @@ def checkpoint() -> None:
         conn.close()
 
 
+def scrubbed_copy() -> bytes:
+    """The database as it may leave the container: mailbox passwords blanked.
+
+    Credentials live in the workspace's Durable Object and arrive as
+    ENGINE_MAILBOXES at every start (reconcile_workspace puts them back), so
+    the copy in R2 — and what GET /db serves — never holds one.
+    """
+    copy = "/tmp/upload.sqlite3"
+    src, dst = sqlite3.connect(DB), sqlite3.connect(copy)
+    try:
+        src.backup(dst)
+        dst.execute("UPDATE outsend_emails_mailbox SET password = ''")
+        dst.commit()
+    finally:
+        src.close()
+        dst.close()
+    try:
+        with open(copy, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(copy)
+
+
 def sync_state() -> None:
     """Persist the whole engine state: database, home, job document."""
     try:
         checkpoint()
         if os.path.exists(DB):
-            r2_put("db.sqlite3", open(DB, "rb").read())
-            for suffix in ("wal", "shm"):
-                side = f"{DB}-{suffix}"
-                if os.path.exists(side) and os.path.getsize(side) > 0:
-                    r2_put(f"db.sqlite3-{suffix}", open(side, "rb").read())
+            r2_put("db.sqlite3", scrubbed_copy())
         import io
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -170,6 +189,78 @@ _CHECK = ("import os,sys,functools; os.environ['DJANGO_SETTINGS_MODULE']='openou
           "import cold_outreach.first_run as fr; "
           "fr.check_ready = functools.partial(fr.check_ready, agent_draft_active=True); "
           "from cold_outreach.__main__ import main; sys.exit(main(['check']))")
+
+
+# The workspace's configuration, applied to the database at every start. The
+# sender seeds its operator and mailbox from the environment only while none
+# exists, so a later change would otherwise be ignored — and its one-mailbox
+# variables cannot describe a pool. This goes through the sender's own
+# set_operator and Mailbox.objects.create_verified (the SMTP-login gate).
+# A retired box keeps its threads: replies are still read and answered, but it
+# opens no conversation and sends no follow-up (its spacing clock never runs out).
+_RECONCILE = r"""
+import json, os, sys
+from datetime import datetime, timezone as tz
+os.environ['DJANGO_SETTINGS_MODULE'] = 'openoutreach.settings'
+import django; django.setup()
+from cold_outreach.core.operator import set_operator
+from cold_outreach.emails.models import Mailbox
+
+RETIRED = datetime(9000, 1, 1, tzinfo=tz.utc)
+name = os.environ.get('OUTSEND_OPERATOR_NAME', '').strip()
+if name:
+    set_operator(full_name=name, email=os.environ.get('OUTSEND_OPERATOR_EMAIL', '').strip())
+
+configured = json.loads(os.environ.get('ENGINE_MAILBOXES') or '[]')
+results = []
+for box in configured:
+    address = box['address']
+    transport = dict(host=box['smtp_host'], port=box['smtp_port'],
+                     imap_host=box['imap_host'], imap_port=box['imap_port'])
+    row = Mailbox.objects.filter(username=address).first()
+    same = row is not None and all(getattr(row, k) == v for k, v in transport.items())
+    if box.get('verify') or not same:
+        if box.get('retired'):
+            results.append({'address': address, 'ok': True, 'retired': True})
+            continue
+        row, reason = Mailbox.objects.create_verified(
+            from_address=address, password=box['app_password'], **transport)
+        if row is None:
+            results.append({'address': address, 'ok': False, 'reason': reason})
+            continue
+    else:
+        row.password = box['app_password']
+    row.next_send_at = RETIRED if box.get('retired') else (
+        None if row.next_send_at == RETIRED else row.next_send_at)
+    if box.get('signature') is not None:
+        row.signature = box['signature']
+    row.save()
+    results.append({'address': address, 'ok': True, 'retired': bool(box.get('retired'))})
+
+# A row no configuration names any more: retired, and its credentials dropped.
+names = {box['address'] for box in configured}
+for row in Mailbox.objects.exclude(username__in=names):
+    row.password, row.next_send_at = '', RETIRED
+    row.save(update_fields=['password', 'next_send_at'])
+    results.append({'address': row.username, 'ok': True, 'retired': True, 'unconfigured': True})
+print(json.dumps(results))
+"""
+MAILBOX_STATUS: list[dict] = []
+
+
+def reconcile_workspace() -> None:
+    """Apply the configuration this instance was started with; record per-box results."""
+    global MAILBOX_STATUS
+    proc = subprocess.run([sys.executable, "-c", _RECONCILE], capture_output=True,
+                          text=True, timeout=600)
+    if proc.returncode != 0:
+        log(f"WARNING: reconcile failed: {proc.stderr.strip()[-2000:]}")
+        MAILBOX_STATUS = [{"ok": False, "reason": "reconcile failed — see logs"}]
+        return
+    MAILBOX_STATUS = json.loads(proc.stdout.strip().splitlines()[-1])
+    for box in MAILBOX_STATUS:
+        log(f"mailbox {box.get('address')}: {'ok' if box['ok'] else box.get('reason')}")
+    sync_state()
 
 
 def run_cli(args: list[str], stdin_text: str | None = None,
@@ -278,12 +369,20 @@ def crm_conversations(limit: int) -> list[dict]:
            LIMIT ?""", (limit,))
 
 
-def crm_mailboxes() -> list[dict]:
-    # the password column is deliberately not selected
-    return query(
-        """SELECT host, port, imap_host, imap_port, username, from_address,
-                  signature, daily_limit, measured_on, next_send_at
-           FROM outsend_emails_mailbox ORDER BY id""")
+def mailboxes() -> list[dict]:
+    """Each configured box: whether it connected, and the pacing it has learned."""
+    rows = {r["username"]: r for r in query(
+        # the password column is deliberately not selected
+        """SELECT username, host, port, imap_host, imap_port, signature,
+                  daily_limit, measured_on, next_send_at
+           FROM outsend_emails_mailbox ORDER BY id""")}
+    out = []
+    for status in MAILBOX_STATUS:
+        row = rows.get(status.get("address"), {})
+        if status.get("retired"):
+            row = {k: v for k, v in row.items() if k != "next_send_at"}
+        out.append({**status, **{k: v for k, v in row.items() if k != "username"}})
+    return out
 
 
 # ── HTTP surface ─────────────────────────────────────────────────────
@@ -324,13 +423,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"leads": crm_leads(self._limit(query))})
         if path == "/crm/conversations":
             return self._json({"messages": crm_conversations(self._limit(query))})
-        if path == "/crm/mailbox":
-            return self._json({"mailboxes": crm_mailboxes()})
+        if path == "/mailboxes":
+            return self._json({"mailboxes": mailboxes()})
         return self._not_found()
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
-        if path == "/ingest":
+        if path == "/leads":
             return self._ingest()
         if path == "/send":
             return self._send()
@@ -448,6 +547,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     load_job_from_store()
+    reconcile_workspace()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log(f"engine up on :{PORT} (workspace {WORKSPACE}, db {DB})")
     server.serve_forever()
