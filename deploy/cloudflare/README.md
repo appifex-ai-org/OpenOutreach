@@ -17,8 +17,8 @@ npx wrangler secret put OUTREACH_SERVICE_TOKEN            # the bearer token for
 npx wrangler deploy
 ```
 
-Then per workspace: `PUT /w/<ws>/config` (the `OUTSEND_*` env), `POST /w/<ws>/check` to
-verify the mailbox by a real SMTP login, `POST /w/<ws>/ingest` leads, `POST /w/<ws>/send`.
+Then per workspace: `PUT /w/<ws>` with `{sender, campaign, mailboxes}` (each mailbox's
+SMTP login is checked before it is kept), `POST /w/<ws>/leads`, `POST /w/<ws>/send`.
 
 | File | What it is |
 |---|---|
