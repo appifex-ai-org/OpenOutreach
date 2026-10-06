@@ -5,8 +5,13 @@
 > Cloudflare: a **sending and CRM engine** that a calling agent drives over HTTP. It replaced
 > an earlier single-tenant scheduled-find deploy on 2026-10-04.
 >
-> **Production status (2026-10-05):** verified end to end in production. The 2026-10-04
-> outage and its root cause — an outbound handler that was never registered — are in
+> **Production status (2026-10-06):** verified end to end in production, including a real
+> send: onboarding with a mailbox whose SMTP login the engine checked, `/check` ready, lead
+> ingest, a sending pass that read the inbox over IMAP and stopped at `draft_pending`, the
+> agent's opener sent over SMTP, the CRM showing the lead `Emailed`, and the message read
+> back from the receiving mailbox with its sign-off, opt-out line and footer. The test
+> mailbox was an [Ethereal](https://ethereal.email) capture account, so nothing was
+> delivered. The 2026-10-04 outage and its root cause are in
 > [cloudflare-findings.md](cloudflare-findings.md).
 >
 > You need a Cloudflare account on the **Workers Paid plan** ($5/month — Containers require
@@ -86,7 +91,7 @@ names one.
 |---|---|
 | `GET /w/<ws>` | `{ready, missing: ["sender"\|"campaign"\|"mailboxes"], sender, campaign, mailboxes}` — answered from the Durable Object, no container start; never returns a credential |
 | `PUT /w/<ws>` | onboarding in one call: any of `{sender, campaign, mailboxes: [...]}`. Sections given replace those sections; mailboxes are upserted by address; anything not given is kept |
-| `PUT /w/<ws>/sender` | `{name, email?, country?}` — who signs; `email` is BCC'd on every send |
+| `PUT /w/<ws>/sender` | `{name, email?, country?}` — who signs; `email` is BCC'd on every send; `country` is an ISO 3166 alpha-2 code (`US`) and sets the timezone of the sending window — first emails leave 08:00–20:00 on weekdays there (UTC when omitted) |
 | `PUT /w/<ws>/campaign` | `{product, target, booking_link?}` — markdown, ≤ 20 000 chars each; what openers are written from |
 | `PUT /w/<ws>/mailboxes/<address>` | `{app_password, smtp?: {host, port}, imap?: {host, port}, signature?}` — Gmail when `smtp`/`imap` are omitted. **The SMTP login is checked before it is kept**: `422 mailbox_rejected` with the provider's reason, and the previous credentials (or no box) stand |
 | `DELETE /w/<ws>/mailboxes/<address>` | **retire** the box: it opens no new conversations and sends no follow-ups, but replies on its threads are still read and answered. A delete would cascade its mail history, so there is none |
