@@ -130,7 +130,7 @@ daily capacity, and a thread always continues from the box that opened it.
 | `POST /w/<ws>/draft` | `{subject, body}` — answers `draft_pending`; the engine sends it as soon as a mailbox is free (an answer given while guards hold is kept, not thrown away) |
 | `GET /w/<ws>/replies` | prospects' replies waiting for the owner: `{id, lead_id, email, name, company, title, subject, suggestion, stale, thread: [last 6 turns], created_at}` |
 | `POST /w/<ws>/replies/<id>` | `{action: "send", body?}` sends the suggestion, or `body` in its place, threaded under the conversation; `{action: "dismiss"}` when the owner answered from their own mailbox. `409` if already decided, or `stale` when the prospect wrote again (the next pass suggests a fresh reply covering both) |
-| `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits, `last_ingest`, `last_check` |
+| `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits — including `caller_lead_id`, the `lead_id` it was ingested with — `last_ingest`, `last_check` |
 | `POST /w/<ws>/check` | what a pass needs, including one ping of the model, reported in the API's field names (`set mailboxes`) |
 | `GET /w/<ws>/crm/leads?limit=` | leads joined with deal state (`Ready`/`Emailed`/`Completed`), outcome, reason, sent-at, chat summary, suppression flag |
 | `GET /w/<ws>/crm/conversations?limit=` | the mail log newest-first, joined to the lead and deal |
