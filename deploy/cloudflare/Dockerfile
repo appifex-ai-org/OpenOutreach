@@ -51,7 +51,7 @@ WORKDIR ${APP_HOME}
 RUN mkdir -p /app/data \
     && chmod -R a+rwX /app /home/ubuntu
 
-COPY container-start shim.py /
+COPY container-start shim.py engine_review.py /
 RUN chmod +x /container-start
 
 # The CRM is not in the image: container-start downloads it from R2 before the

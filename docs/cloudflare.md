@@ -27,14 +27,20 @@ contract. The split, and why:
 |---|---|
 | Finding and qualifying leads | the calling agent (voki: its own model + its own data tools) |
 | Writing the openers | the calling agent, via the `draft_pending` protocol |
-| Follow-ups and replies | **the engine**, with the model behind `llm.internal` |
+| Follow-ups | **the engine**, with the model behind `llm.internal` |
+| Replies to a prospect who wrote back | the engine's model **suggests**; the owner sends (as is or edited) or dismisses — `/replies` |
 | Leads in (JSON Lines, upsert on `lead_id`) | **the engine** — suppression checked at the door |
 | Mailbox, SMTP/IMAP, sending window, daily cap, pacing | **the engine** |
 | The CRM: leads, deals, conversations, mail log, suppression | **the engine** — one SQLite file per workspace |
 
 Openers arrive as answers to `draft_pending` (the CLI's `--agent-draft` contract), but
 `--agent-draft` covers the opener only: **follow-ups and replies are the sender's own model
-calls.** The container reaches that model at `http://llm.internal/v1` (Chat Completions, as
+calls.** Follow-ups go out on their own (they are cold touches under the same window, cap and
+pacing as openers). **Replies do not:** every sending pass runs through
+`deploy/cloudflare/engine_review.py`, which lets the sender's reply step decide as usual but
+holds a `send_message` as a suggestion for the owner (`/replies`). Opt-outs are still honoured
+at once and closed conversations still close — neither writes to the prospect. A deal with a
+reply waiting is never followed up (the sender never chases a thread the prospect answered). The container reaches that model at `http://llm.internal/v1` (Chat Completions, as
 `openai_compatible:<LLM_MODEL>`); the Worker answers that hostname, forces `LLM_MODEL`, and
 adds `LLM_API_TOKEN` — so, like the R2 credentials, the model credential never enters a
 container. Today that is the CLI proxy Voki runs on (`gpt-6.1-sol`), set in `wrangler.toml`
@@ -122,6 +128,8 @@ daily capacity, and a thread always continues from the box that opened it.
 | `POST /w/<ws>/leads` | body = **JSON Lines**, one record per line — the public pipe. Upserts on `lead_id`, latest-wins; suppression checked and terminal; a malformed line is skipped and counted; a blank `email` is stored, not rejected |
 | `POST /w/<ws>/send` | `{n?: 5 \| "all"}` — starts a sending pass in `--agent-draft` mode (async; poll `/pending`). The pass reads the mail, answers replies, and stops at the first deal needing an opener |
 | `POST /w/<ws>/draft` | `{subject, body}` — answers `draft_pending`; the engine sends it as soon as a mailbox is free (an answer given while guards hold is kept, not thrown away) |
+| `GET /w/<ws>/replies` | prospects' replies waiting for the owner: `{id, lead_id, email, name, company, title, subject, suggestion, stale, thread: [last 6 turns], created_at}` |
+| `POST /w/<ws>/replies/<id>` | `{action: "send", body?}` sends the suggestion, or `body` in its place, threaded under the conversation; `{action: "dismiss"}` when the owner answered from their own mailbox. `409` if already decided, or `stale` when the prospect wrote again (the next pass suggests a fresh reply covering both) |
 | `GET /w/<ws>/pending` | the job document: `phase` (`idle`/`running`/`draft_pending`/`done`/`error`), the pending deal's fields when a draft waits, `last_ingest`, `last_check` |
 | `POST /w/<ws>/check` | what a pass needs, including one ping of the model, reported in the API's field names (`set mailboxes`) |
 | `GET /w/<ws>/crm/leads?limit=` | leads joined with deal state (`Ready`/`Emailed`/`Completed`), outcome, reason, sent-at, chat summary, suppression flag |

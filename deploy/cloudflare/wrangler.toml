@@ -16,10 +16,10 @@ enabled = true
 
 # The engine container. standard-1 (½ vCPU, 4 GiB, 8 GB disk) is roomy for
 # what is now a sender + CRM; billing stops when the instance sleeps.
-# Image: built and pushed with `npx wrangler containers build --push -t openoutreach-engine:v6 .`
+# Image: built and pushed with `npx wrangler containers build --push -t openoutreach-engine:v7 .`
 [[containers]]
 class_name = "OutreachContainer"
-image = "registry.cloudflare.com/5db6a7cf9dc844657c4b9ce8eb7da202/openoutreach-engine:v6"
+image = "registry.cloudflare.com/5db6a7cf9dc844657c4b9ce8eb7da202/openoutreach-engine:v7"
 instance_type = "standard-1"
 
 # The named-instance binding: getContainer(OUTREACH, <workspaceId>) is both

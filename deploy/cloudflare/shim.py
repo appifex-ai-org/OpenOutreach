@@ -257,6 +257,12 @@ def reconcile_workspace() -> None:
     sync_state()
 
 
+# Every sending pass runs with replies held for the owner (engine_review.py):
+# the sender's model still drafts them, nothing reaches a prospect unreviewed.
+REVIEW = [sys.executable, "/engine_review.py"]
+_PASS = [*REVIEW, "pass"]
+
+
 def run_cli(args: list[str], stdin_text: str | None = None,
             timeout: int = SEND_TIMEOUT) -> dict:
     """Run one CLI invocation and translate its exit contract to a dict."""
@@ -419,6 +425,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"messages": crm_conversations(self._limit(query))})
         if path == "/mailboxes":
             return self._json({"mailboxes": mailboxes()})
+        if path == "/replies":
+            proc = subprocess.run([*REVIEW, "list"], capture_output=True, text=True, timeout=120)
+            if proc.returncode != 0:
+                return self._json({"error": "review_list_failed", "message": proc.stderr[-500:]}, 500)
+            return self._json(json.loads(proc.stdout.strip().splitlines()[-1]))
         return self._not_found()
 
     def do_POST(self) -> None:
@@ -431,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._draft()
         if path == "/check":
             return self._check()
+        if path.startswith("/replies/"):
+            return self._decide_reply(path.removeprefix("/replies/"))
         return self._not_found()
 
     @staticmethod
@@ -479,7 +492,7 @@ class Handler(BaseHTTPRequestHandler):
             if JOB.get("phase") == "running":
                 return self._json({"error": "busy"}, 409)
         n = payload.get("n")
-        args = ["/opt/venv/bin/openoutreach", "send"]
+        args = [*_PASS, "send"]
         if n is not None:
             if n != "all" and not (isinstance(n, int) and 1 <= n <= 500):
                 return self._json({"error": "bad_n"}, 400)
@@ -500,9 +513,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no_pending_draft"}, 409)
         if not isinstance(subject, str) or not isinstance(body, str) or not body.strip():
             return self._json({"error": "bad_draft"}, 400)
-        background("draft", ["/opt/venv/bin/openoutreach", "send",
+        background("draft", [*_PASS, "send",
                              "--agent-draft", "--subject", subject, "--body", body, "--json"])
         return self._json({"started": True}, 202)
+
+    def _decide_reply(self, review_id: str) -> None:
+        """Send (as suggested, or edited) or dismiss one held reply."""
+        if not review_id.isdigit():
+            return self._not_found()
+        try:
+            payload = json.loads(self._body(100_000) or b"{}")
+        except ValueError:
+            return self._json({"error": "bad_json"}, 400)
+        action = payload.get("action")
+        body = payload.get("body")
+        if action not in ("send", "dismiss") or (body is not None and not isinstance(body, str)):
+            return self._json({"error": "bad_request",
+                               "message": "expected {action: send|dismiss, body?: string}"}, 400)
+        acquired = RUN_MUTEX.acquire(timeout=30)
+        if not acquired:
+            return self._json({"error": "busy"}, 409)
+        try:
+            proc = subprocess.run([*REVIEW, action, review_id], capture_output=True, text=True,
+                                  timeout=300, input=json.dumps({"body": body}) if body is not None else "")
+            try:
+                result = json.loads(proc.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return self._json({"error": "review_failed", "message": proc.stderr[-800:]}, 500)
+            if proc.returncode == 0:
+                sync_state()
+            status = {0: 200, 2: 400, 3: 409, 4: 404}.get(proc.returncode, 500)
+            return self._json(result, status)
+        finally:
+            RUN_MUTEX.release()
 
     def _check(self) -> None:
         """`outsend check`: verifies what a run needs — including a real
