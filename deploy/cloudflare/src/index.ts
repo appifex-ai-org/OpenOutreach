@@ -139,6 +139,18 @@ function missing(w: Workspace | null): string[] {
 }
 
 /** What a caller may see: everything but credentials. */
+/** A key-order-independent serialisation, for "did this patch change anything?". */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 function describe(ws: string, w: Workspace | null) {
   const needs = missing(w);
   return {
@@ -437,6 +449,9 @@ export class OutreachContainer extends Container<Env> {
     if (Object.keys(next.mailboxes).length > MAX_MAILBOXES) {
       throw new BadRequest(`at most ${MAX_MAILBOXES} mailboxes per workspace`);
     }
+    // An unchanged configuration is already the one the instance started with:
+    // restarting it would throw away a warm container for nothing.
+    if (canonical(next) === canonical(previous)) return { ...describe(ws, next), rejected: [] };
     await this.ctx.storage.put("workspace", next);
     await this.restart();
 
